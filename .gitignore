@@ -1,0 +1,70 @@
+# Claude Code — local-only settings (CLAUDE.md and settings.json are committed)
+.claude/settings.local.json
+.claude/memory/
+
+# Node / npm
+node_modules/
+dist/
+.next/
+.nuxt/
+.output/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Rust / Cargo
+target/
+**/*.rs.bk
+Cargo.lock   # remove this line if you want to pin deps (recommended for apps)
+
+# Tauri
+src-tauri/target/
+src-tauri/WixTools/
+*.AppImage
+*.deb
+*.dmg
+*.exe
+*.msi
+*.app
+
+# SQLite
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+*.swp
+*.swo
+*~
+
+# Logs & temp
+logs/
+*.log
+tmp/
+temp/
+
+# Docs — keep .md files, ignore binary/generated content
+docs/*.pdf
