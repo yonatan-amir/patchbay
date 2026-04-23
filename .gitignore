@@ -1,6 +1,6 @@
-# Claude Code — local-only settings (CLAUDE.md and settings.json are committed)
-.claude/settings.local.json
-.claude/memory/
+# Claude Code — dev-only, not for the repo
+.claude/
+CLAUDE.md
 
 # Node / npm
 node_modules/
@@ -17,10 +17,7 @@ pnpm-debug.log*
 # Rust / Cargo
 target/
 **/*.rs.bk
-Cargo.lock   # remove this line if you want to pin deps (recommended for apps)
-
 # Tauri
-src-tauri/target/
 src-tauri/WixTools/
 *.AppImage
 *.deb
@@ -66,5 +63,5 @@ logs/
 tmp/
 temp/
 
-# Docs — keep .md files, ignore binary/generated content
-docs/*.pdf
+# Docs — dev-only internal docs
+docs/

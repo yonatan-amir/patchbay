@@ -1,0 +1,9 @@
+[package]
+name = "patchbay-core"
+version.workspace = true
+edition.workspace = true
+description = "Scanner, indexer, and audio analysis for Patchbay"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

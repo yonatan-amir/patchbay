@@ -1,0 +1,14 @@
+{
+  "name": "patchbay",
+  "private": true,
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "ui:dev": "npm run dev --prefix ui",
+    "ui:build": "npm run build --prefix ui",
+    "ui:install": "npm install --prefix ui"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

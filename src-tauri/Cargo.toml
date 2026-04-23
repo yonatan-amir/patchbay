@@ -1,0 +1,17 @@
+[package]
+name = "patchbay-app"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "patchbay_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+patchbay-core = { path = "../patchbay-core" }
