@@ -3,7 +3,8 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-pub const ALL: &[Migration] = &[Migration {
+pub const ALL: &[Migration] = &[
+    Migration {
     version: 1,
     sql: "
         CREATE TABLE plugins (
@@ -114,5 +115,13 @@ pub const ALL: &[Migration] = &[Migration {
         CREATE INDEX idx_plugins_path         ON plugins(path);
         CREATE INDEX idx_chain_slots_chain_id ON chain_slots(chain_id);
         CREATE INDEX idx_scan_sessions_status ON scan_sessions(status);
+    ",
+},
+Migration {
+    version: 2,
+    sql: "
+        ALTER TABLE plugins ADD COLUMN class_id TEXT;
+        ALTER TABLE plugins ADD COLUMN category TEXT;
+        CREATE UNIQUE INDEX idx_plugins_path_unique ON plugins(path);
     ",
 }];

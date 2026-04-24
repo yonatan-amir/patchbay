@@ -14,6 +14,18 @@ pub struct Database {
     conn: Connection,
 }
 
+pub struct PluginRecord {
+    pub sync_id: String,
+    pub name: String,
+    pub vendor: Option<String>,
+    pub format: String,
+    pub path: String,
+    pub version: Option<String>,
+    pub class_id: Option<String>,
+    pub category: Option<String>,
+    pub device_id: String,
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
@@ -33,6 +45,26 @@ impl Database {
         let db = Self { conn };
         db.run_migrations()?;
         Ok(db)
+    }
+
+    pub fn upsert_plugin(&self, p: &PluginRecord) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO plugins
+                 (sync_id, name, vendor, format, path, version, class_id, category, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(path) DO UPDATE SET
+                 name       = excluded.name,
+                 vendor     = excluded.vendor,
+                 version    = excluded.version,
+                 class_id   = excluded.class_id,
+                 category   = excluded.category,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            rusqlite::params![
+                p.sync_id, p.name, p.vendor, p.format, p.path,
+                p.version, p.class_id, p.category, p.device_id
+            ],
+        )?;
+        Ok(())
     }
 
     fn run_migrations(&self) -> Result<(), DbError> {
