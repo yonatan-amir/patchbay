@@ -63,7 +63,7 @@ struct ClassInfo {
     vendor: Option<String>,
     #[serde(rename = "Version")]
     version: Option<String>,
-    // Sub Categories is the useful one ("Fx|Dynamics"), Category is always "Audio Module Class"
+    // Sub Categories carries the useful taxonomy ("Fx|EQ"); Category is always "Audio Module Class"
     #[serde(rename = "Sub Categories")]
     sub_categories: Option<Vec<String>>,
 }
@@ -139,24 +139,36 @@ fn collect_bundles(
 fn parse_vst3_bundle(bundle: &Path) -> Result<ScannedPlugin, ScanError> {
     let moduleinfo_path = bundle.join("Contents").join("moduleinfo.json");
 
-    if !moduleinfo_path.exists() {
-        // Older VST3 plugins pre-date moduleinfo.json — use the bundle filename as fallback
-        return Ok(ScannedPlugin {
-            name: file_stem(bundle),
-            vendor: None,
-            version: None,
-            category: None,
-            class_id: None,
-            path: bundle.to_path_buf(),
-            format: PluginFormat::Vst3,
-        });
+    if moduleinfo_path.exists() {
+        return parse_from_moduleinfo(bundle, &moduleinfo_path);
     }
 
-    let data = std::fs::read_to_string(&moduleinfo_path)
-        .map_err(|e| ScanError::Io { path: moduleinfo_path.clone(), source: e })?;
+    // No moduleinfo.json (true for ~99% of real-world Mac VST3 plugins).
+    // Extract what we can from Info.plist; fall back to bundle filename as last resort.
+    let plist_path = bundle.join("Contents").join("Info.plist");
+    let (plist_name, version, vendor) = if plist_path.exists() {
+        read_info_plist(&plist_path)
+    } else {
+        (None, None, None)
+    };
+
+    Ok(ScannedPlugin {
+        name: plist_name.unwrap_or_else(|| file_stem(bundle)),
+        vendor,
+        version,
+        category: None,
+        class_id: None,
+        path: bundle.to_path_buf(),
+        format: PluginFormat::Vst3,
+    })
+}
+
+fn parse_from_moduleinfo(bundle: &Path, path: &Path) -> Result<ScannedPlugin, ScanError> {
+    let data = std::fs::read_to_string(path)
+        .map_err(|e| ScanError::Io { path: path.to_path_buf(), source: e })?;
 
     let info: ModuleInfo = serde_json::from_str(&data)
-        .map_err(|e| ScanError::Json { path: moduleinfo_path, source: e })?;
+        .map_err(|e| ScanError::Json { path: path.to_path_buf(), source: e })?;
 
     let first_class = info.classes.as_deref().and_then(|c| c.first());
 
@@ -173,7 +185,6 @@ fn parse_vst3_bundle(bundle: &Path) -> Result<ScannedPlugin, ScanError> {
         .and_then(|c| c.version.clone())
         .or_else(|| info.version.clone());
 
-    // Join sub-categories with "|" ("Fx|Dynamics") — ignore the generic "Audio Module Class" category
     let category = first_class.and_then(|c| {
         c.sub_categories
             .as_ref()
@@ -194,6 +205,75 @@ fn parse_vst3_bundle(bundle: &Path) -> Result<ScannedPlugin, ScanError> {
     })
 }
 
+/// Returns (name, version, vendor) from an Info.plist.
+/// All fields are best-effort — parse failures return None rather than errors.
+fn read_info_plist(path: &Path) -> (Option<String>, Option<String>, Option<String>) {
+    let Ok(val) = plist::Value::from_file(path) else {
+        return (None, None, None);
+    };
+    let Some(dict) = val.as_dictionary() else {
+        return (None, None, None);
+    };
+
+    let name = dict.get("CFBundleName")
+        .and_then(|v| v.as_string())
+        .map(str::to_string);
+
+    let version = dict.get("CFBundleShortVersionString")
+        .and_then(|v| v.as_string())
+        .map(str::to_string);
+
+    // Primary: extract vendor from the copyright string in CFBundleGetInfoString
+    // e.g. "4.3.1 (R0), Copyright © 2025 Native Instruments GmbH" → "Native Instruments GmbH"
+    let vendor = dict.get("CFBundleGetInfoString")
+        .and_then(|v| v.as_string())
+        .and_then(extract_vendor_from_copyright)
+        .or_else(|| {
+            // Fallback: reverse-DNS bundle identifier
+            // e.g. "com.plugin-alliance.vst3.amek" → "plugin alliance"
+            dict.get("CFBundleIdentifier")
+                .and_then(|v| v.as_string())
+                .and_then(extract_vendor_from_bundle_id)
+        });
+
+    (name, version, vendor)
+}
+
+/// Finds the last standalone 4-digit year in a copyright string and returns everything after it.
+/// "4.3.1, Copyright © 2025 Native Instruments GmbH" → Some("Native Instruments GmbH")
+fn extract_vendor_from_copyright(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut last_year_end: Option<usize> = None;
+    let mut i = 0;
+    while i + 4 <= len {
+        if bytes[i..i + 4].iter().all(|b| b.is_ascii_digit()) {
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
+            let after_ok = i + 4 >= len || !bytes[i + 4].is_ascii_digit();
+            if before_ok && after_ok {
+                last_year_end = Some(i + 4);
+            }
+        }
+        i += 1;
+    }
+    let after = &s[last_year_end?..];
+    let vendor = after.trim_matches(|c: char| !c.is_alphanumeric() && c != '-').trim();
+    if vendor.is_empty() { None } else { Some(vendor.to_string()) }
+}
+
+/// Extracts the vendor segment from a reverse-DNS bundle identifier.
+/// "com.plugin-alliance.vst3.amek" → Some("plugin alliance")
+fn extract_vendor_from_bundle_id(id: &str) -> Option<String> {
+    let mut parts = id.splitn(3, '.');
+    let tld = parts.next()?;
+    let vendor = parts.next()?;
+    if matches!(tld, "com" | "net" | "org" | "io") && !vendor.is_empty() && vendor != "apple" {
+        Some(vendor.replace('-', " "))
+    } else {
+        None
+    }
+}
+
 fn file_stem(path: &Path) -> String {
     path.file_stem()
         .unwrap_or_default()
@@ -209,20 +289,38 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn make_bundle(dir: &Path, name: &str, moduleinfo: Option<&str>) -> PathBuf {
+    fn make_bundle(dir: &Path, name: &str, moduleinfo: Option<&str>, plist: Option<&str>) -> PathBuf {
         let bundle = dir.join(format!("{name}.vst3"));
         fs::create_dir_all(bundle.join("Contents")).unwrap();
         if let Some(json) = moduleinfo {
             fs::write(bundle.join("Contents").join("moduleinfo.json"), json).unwrap();
         }
+        if let Some(xml) = plist {
+            fs::write(bundle.join("Contents").join("Info.plist"), xml).unwrap();
+        }
         bundle
     }
+
+    const BATTERY_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleName</key><string>Battery 4</string>
+    <key>CFBundleShortVersionString</key><string>4.3.1</string>
+    <key>CFBundleGetInfoString</key><string>4.3.1 (R0), Copyright © 2025 Native Instruments GmbH</string>
+    <key>CFBundleIdentifier</key><string>com.native-instruments.Battery4.vst3</string>
+</dict></plist>"#;
+
+    const AMEK_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleShortVersionString</key><string>1.1.1</string>
+    <key>CFBundleIdentifier</key><string>com.plugin-alliance.vst3.amekmasteringcompressor</string>
+</dict></plist>"#;
 
     #[test]
     fn parses_moduleinfo_json() {
         let tmp = TempDir::new().unwrap();
-        make_bundle(tmp.path(), "TestPlugin", Some(r#"
-        {
+        make_bundle(tmp.path(), "TestPlugin", Some(r#"{
             "Name": "Test Plugin",
             "Version": "2.1.0",
             "Factory Info": { "Vendor": "Acme Audio" },
@@ -233,8 +331,7 @@ mod tests {
                 "Version": "2.1.0",
                 "Sub Categories": ["Fx", "EQ"]
             }]
-        }
-        "#));
+        }"#), None);
 
         let (plugins, errors) = scan_vst3(&[tmp.path().to_path_buf()]);
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
@@ -248,9 +345,36 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_bundle_name_when_no_moduleinfo() {
+    fn reads_info_plist_with_copyright_vendor() {
         let tmp = TempDir::new().unwrap();
-        make_bundle(tmp.path(), "Legacy Plugin", None);
+        make_bundle(tmp.path(), "Battery 4", None, Some(BATTERY_PLIST));
+
+        let (plugins, errors) = scan_vst3(&[tmp.path().to_path_buf()]);
+        assert!(errors.is_empty());
+        assert_eq!(plugins.len(), 1);
+        let p = &plugins[0];
+        assert_eq!(p.name, "Battery 4");
+        assert_eq!(p.version.as_deref(), Some("4.3.1"));
+        assert_eq!(p.vendor.as_deref(), Some("Native Instruments GmbH"));
+    }
+
+    #[test]
+    fn falls_back_to_bundle_id_vendor_when_no_copyright() {
+        let tmp = TempDir::new().unwrap();
+        make_bundle(tmp.path(), "AMEK Mastering Compressor", None, Some(AMEK_PLIST));
+
+        let (plugins, errors) = scan_vst3(&[tmp.path().to_path_buf()]);
+        assert!(errors.is_empty());
+        assert_eq!(plugins.len(), 1);
+        let p = &plugins[0];
+        assert_eq!(p.version.as_deref(), Some("1.1.1"));
+        assert_eq!(p.vendor.as_deref(), Some("plugin alliance"));
+    }
+
+    #[test]
+    fn falls_back_to_bundle_name_when_no_metadata() {
+        let tmp = TempDir::new().unwrap();
+        make_bundle(tmp.path(), "Legacy Plugin", None, None);
 
         let (plugins, errors) = scan_vst3(&[tmp.path().to_path_buf()]);
         assert!(errors.is_empty());
@@ -261,8 +385,7 @@ mod tests {
 
     #[test]
     fn skips_nonexistent_paths() {
-        let (plugins, errors) =
-            scan_vst3(&[PathBuf::from("/does/not/exist/VST3")]);
+        let (plugins, errors) = scan_vst3(&[PathBuf::from("/does/not/exist/VST3")]);
         assert!(plugins.is_empty());
         assert!(errors.is_empty());
     }
@@ -272,17 +395,42 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let vendor_dir = tmp.path().join("Fabfilter");
         fs::create_dir_all(&vendor_dir).unwrap();
-        make_bundle(&vendor_dir, "Pro-Q 3", Some(r#"
-        {
+        make_bundle(&vendor_dir, "Pro-Q 3", Some(r#"{
             "Name": "Pro-Q 3",
             "Factory Info": { "Vendor": "FabFilter" },
             "Classes": [{ "CID": "AABB", "Name": "Pro-Q 3", "Sub Categories": ["Fx", "EQ"] }]
-        }
-        "#));
+        }"#), None);
 
         let (plugins, errors) = scan_vst3(&[tmp.path().to_path_buf()]);
         assert!(errors.is_empty());
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "Pro-Q 3");
+    }
+
+    #[test]
+    fn extract_vendor_copyright_parses_correctly() {
+        assert_eq!(
+            extract_vendor_from_copyright("4.3.1 (R0), Copyright © 2025 Native Instruments GmbH"),
+            Some("Native Instruments GmbH".to_string())
+        );
+        assert_eq!(
+            extract_vendor_from_copyright("v1.0, Copyright 2023 Acme Audio Ltd."),
+            Some("Acme Audio Ltd".to_string())
+        );
+        assert_eq!(extract_vendor_from_copyright("no year here"), None);
+    }
+
+    #[test]
+    fn extract_vendor_bundle_id_parses_correctly() {
+        assert_eq!(
+            extract_vendor_from_bundle_id("com.plugin-alliance.vst3.amek"),
+            Some("plugin alliance".to_string())
+        );
+        assert_eq!(
+            extract_vendor_from_bundle_id("com.native-instruments.Battery4"),
+            Some("native instruments".to_string())
+        );
+        assert_eq!(extract_vendor_from_bundle_id("com.apple.coreaudio"), None);
+        assert_eq!(extract_vendor_from_bundle_id("notreversedns"), None);
     }
 }
