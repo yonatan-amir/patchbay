@@ -8,7 +8,6 @@ use super::{PluginFormat, ScanError, ScannedPlugin};
 type OSType = u32;
 type AudioComponent = *mut c_void;
 type CFStringRef = *const c_void;
-type CFURLRef = *const c_void;
 
 #[repr(C)]
 struct AudioComponentDescription {
@@ -36,8 +35,6 @@ extern "C" {
         outDesc: *mut AudioComponentDescription,
     ) -> i32;
 
-    // "Get" rule: caller does NOT own the returned CFURLRef — do not CFRelease it.
-    fn AudioComponentGetBundleURL(inComponent: AudioComponent) -> CFURLRef;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -49,14 +46,10 @@ extern "C" {
         encoding: u32,
     ) -> bool;
 
-    // "Copy" rule: caller owns the returned CFStringRef — must CFRelease it.
-    fn CFURLCopyFileSystemPath(anURL: CFURLRef, pathStyle: i32) -> CFStringRef;
-
     fn CFRelease(cf: *const c_void);
 }
 
 const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
-const CF_URL_POSIX_PATH_STYLE: i32 = 0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -169,30 +162,13 @@ pub fn scan_au_registry() -> (Vec<ScannedPlugin>, Vec<ScanError>) {
             }
         };
 
-        // ── bundle path via AudioComponentGetBundleURL ───────────────────────
-        // Get rule: caller does NOT own the CFURLRef — do not CFRelease it.
-        // CFURLCopyFileSystemPath returns an owned CFStringRef — must CFRelease.
-        let path = unsafe {
-            let url_ref = AudioComponentGetBundleURL(comp);
-            if url_ref.is_null() {
-                PathBuf::new()
-            } else {
-                let path_ref = CFURLCopyFileSystemPath(url_ref, CF_URL_POSIX_PATH_STYLE);
-                let s = cfstring_to_rust(path_ref);
-                if !path_ref.is_null() {
-                    CFRelease(path_ref);
-                }
-                s.map(PathBuf::from).unwrap_or_default()
-            }
-        };
-
         plugins.push(ScannedPlugin {
             name,
             vendor,
             version: None,
             category,
             class_id: Some(class_id),
-            path,
+            path: PathBuf::new(),
             format: PluginFormat::Au,
         });
     }
