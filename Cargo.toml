@@ -3,6 +3,7 @@ members = [
     "src-tauri",
     "patchbay-core",
     "patchbay-vst2-probe",
+    "patchbay-clap-probe",
 ]
 resolver = "2"
 

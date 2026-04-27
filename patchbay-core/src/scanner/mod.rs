@@ -5,6 +5,7 @@ use thiserror::Error;
 #[cfg(target_os = "macos")]
 pub mod au;
 
+pub mod clap;
 pub mod vst2;
 
 #[derive(Debug, Error)]
@@ -30,6 +31,7 @@ pub enum PluginFormat {
     Vst3,
     Au,
     Vst2,
+    Clap,
 }
 
 impl PluginFormat {
@@ -38,6 +40,7 @@ impl PluginFormat {
             Self::Vst3 => "VST3",
             Self::Au => "AU",
             Self::Vst2 => "VST2",
+            Self::Clap => "CLAP",
         }
     }
 }
@@ -126,6 +129,44 @@ pub fn default_vst2_paths() -> Vec<PathBuf> {
     }
 
     paths
+}
+
+pub fn default_clap_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        paths.push(PathBuf::from("/Library/Audio/Plug-Ins/CLAP"));
+        if let Ok(home) = std::env::var("HOME") {
+            paths.push(PathBuf::from(home).join("Library/Audio/Plug-Ins/CLAP"));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let pf = std::env::var("COMMONPROGRAMFILES")
+            .unwrap_or_else(|_| r"C:\Program Files\Common Files".to_string());
+        let pf86 = std::env::var("COMMONPROGRAMFILES(X86)")
+            .unwrap_or_else(|_| r"C:\Program Files (x86)\Common Files".to_string());
+        paths.push(PathBuf::from(&pf).join("CLAP"));
+        paths.push(PathBuf::from(&pf86).join("CLAP"));
+    }
+
+    paths
+}
+
+/// Scan `paths` for CLAP plugins, optionally probing each binary for metadata.
+///
+/// Uses the `patchbay-clap-probe` sidecar binary when available. Pass the
+/// result of `clap::find_probe()` or `None` to skip metadata extraction.
+/// One `.clap` bundle may yield multiple `ScannedPlugin`s.
+pub fn scan_clap(paths: &[PathBuf], probe: Option<&std::path::Path>) -> (Vec<ScannedPlugin>, Vec<ScanError>) {
+    clap::scan_clap(paths, probe)
+}
+
+/// Walk `paths` for `.clap` bundle entries without loading any plugin code.
+pub fn walk_clap_bundles(paths: &[PathBuf]) -> Vec<PathBuf> {
+    clap::walk_clap_bundles(paths)
 }
 
 /// Scan `paths` for VST2 plugins, optionally probing each binary for metadata.

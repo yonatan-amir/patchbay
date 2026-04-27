@@ -1,0 +1,13 @@
+[package]
+name = "patchbay-clap-probe"
+version.workspace = true
+edition.workspace = true
+description = "Sandboxed CLAP metadata extractor -- spawned per-plugin by the scanner"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+libloading = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"

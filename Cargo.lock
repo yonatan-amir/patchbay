@@ -2215,6 +2215,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "patchbay-clap-probe"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "plist",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "patchbay-core"
 version = "0.1.0"
 dependencies = [
