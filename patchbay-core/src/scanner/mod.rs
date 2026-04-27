@@ -5,6 +5,8 @@ use thiserror::Error;
 #[cfg(target_os = "macos")]
 pub mod au;
 
+pub mod vst2;
+
 #[derive(Debug, Error)]
 pub enum ScanError {
     #[error("IO error at {path}: {source}")]
@@ -27,6 +29,7 @@ pub struct ScannedPlugin {
 pub enum PluginFormat {
     Vst3,
     Au,
+    Vst2,
 }
 
 impl PluginFormat {
@@ -34,6 +37,7 @@ impl PluginFormat {
         match self {
             Self::Vst3 => "VST3",
             Self::Au => "AU",
+            Self::Vst2 => "VST2",
         }
     }
 }
@@ -94,6 +98,48 @@ pub fn default_vst3_paths() -> Vec<PathBuf> {
     }
 
     paths
+}
+
+pub fn default_vst2_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        paths.push(PathBuf::from("/Library/Audio/Plug-Ins/VST"));
+        if let Ok(home) = std::env::var("HOME") {
+            paths.push(PathBuf::from(home).join("Library/Audio/Plug-Ins/VST"));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let pf = std::env::var("PROGRAMFILES")
+            .unwrap_or_else(|_| r"C:\Program Files".to_string());
+        let pf86 = std::env::var("PROGRAMFILES(X86)")
+            .unwrap_or_else(|_| r"C:\Program Files (x86)".to_string());
+        paths.push(PathBuf::from(&pf).join("VSTPlugins"));
+        paths.push(PathBuf::from(&pf86).join("VSTPlugins"));
+        paths.push(PathBuf::from(&pf).join("Common Files").join("VST2"));
+        paths.push(PathBuf::from(&pf86).join("Common Files").join("VST2"));
+        paths.push(PathBuf::from(&pf).join("Steinberg").join("VstPlugins"));
+        paths.push(PathBuf::from(&pf86).join("Steinberg").join("VstPlugins"));
+    }
+
+    paths
+}
+
+/// Scan `paths` for VST2 plugins, optionally probing each binary for metadata.
+///
+/// Uses the `patchbay-vst2-probe` sidecar binary when available. Pass the
+/// result of `vst2::find_probe()` or `None` to skip metadata extraction.
+pub fn scan_vst2(paths: &[PathBuf], probe: Option<&std::path::Path>) -> (Vec<ScannedPlugin>, Vec<ScanError>) {
+    vst2::scan_vst2(paths, probe)
+}
+
+/// Walk `paths` for `.vst` bundle directories (macOS) or `.dll` files (Windows)
+/// without loading any plugin code. Useful for fast inventory.
+pub fn walk_vst2_bundles(paths: &[PathBuf]) -> Vec<PathBuf> {
+    vst2::walk_vst_bundles(paths)
 }
 
 /// Walk `paths`, find every `.vst3` bundle, parse metadata.
@@ -228,7 +274,7 @@ pub fn scan_au() -> (Vec<ScannedPlugin>, Vec<ScanError>) {
 
 /// Returns (name, version, vendor) from an Info.plist.
 /// All fields are best-effort — parse failures return None rather than errors.
-fn read_info_plist(path: &Path) -> (Option<String>, Option<String>, Option<String>) {
+pub(crate) fn read_info_plist(path: &Path) -> (Option<String>, Option<String>, Option<String>) {
     let Ok(val) = plist::Value::from_file(path) else {
         return (None, None, None);
     };
@@ -295,7 +341,7 @@ fn extract_vendor_from_bundle_id(id: &str) -> Option<String> {
     }
 }
 
-fn file_stem(path: &Path) -> String {
+pub(crate) fn file_stem(path: &Path) -> String {
     path.file_stem()
         .unwrap_or_default()
         .to_string_lossy()

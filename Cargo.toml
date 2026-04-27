@@ -2,6 +2,7 @@
 members = [
     "src-tauri",
     "patchbay-core",
+    "patchbay-vst2-probe",
 ]
 resolver = "2"
 
