@@ -23,12 +23,14 @@ pub struct ScannedPlugin {
 #[derive(Debug, Clone, Copy)]
 pub enum PluginFormat {
     Vst3,
+    Au,
 }
 
 impl PluginFormat {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Vst3 => "VST3",
+            Self::Au => "AU",
         }
     }
 }
@@ -68,7 +70,7 @@ struct ClassInfo {
     sub_categories: Option<Vec<String>>,
 }
 
-// --- Public API ---
+// --- VST3 Public API ---
 
 pub fn default_vst3_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -107,7 +109,7 @@ pub fn scan_vst3(paths: &[PathBuf]) -> (Vec<ScannedPlugin>, Vec<ScanError>) {
     (plugins, errors)
 }
 
-// --- Internals ---
+// --- VST3 Internals ---
 
 fn collect_bundles(
     dir: &Path,
@@ -205,6 +207,193 @@ fn parse_from_moduleinfo(bundle: &Path, path: &Path) -> Result<ScannedPlugin, Sc
     })
 }
 
+// --- AU Public API ---
+
+pub fn default_au_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        paths.push(PathBuf::from("/Library/Audio/Plug-Ins/Components"));
+        if let Ok(home) = std::env::var("HOME") {
+            paths.push(PathBuf::from(home).join("Library/Audio/Plug-Ins/Components"));
+        }
+    }
+    paths
+}
+
+/// Walk `paths`, find every `.component` bundle, parse metadata.
+/// Returns (successful results, non-fatal errors) so callers see partial progress.
+pub fn scan_au(paths: &[PathBuf]) -> (Vec<ScannedPlugin>, Vec<ScanError>) {
+    let mut plugins = Vec::new();
+    let mut errors = Vec::new();
+    for root in paths {
+        if !root.exists() {
+            continue;
+        }
+        collect_au_bundles(root, &mut plugins, &mut errors);
+    }
+    (plugins, errors)
+}
+
+// --- AU Internals ---
+
+fn collect_au_bundles(
+    dir: &Path,
+    plugins: &mut Vec<ScannedPlugin>,
+    errors: &mut Vec<ScanError>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            errors.push(ScanError::Io { path: dir.to_path_buf(), source: e });
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e.eq_ignore_ascii_case("component")).unwrap_or(false) {
+            match parse_au_bundle(&path) {
+                Ok(p) => plugins.push(p),
+                Err(e) => errors.push(e),
+            }
+        }
+    }
+}
+
+fn parse_au_bundle(bundle: &Path) -> Result<ScannedPlugin, ScanError> {
+    let plist_path = bundle.join("Contents").join("Info.plist");
+    if !plist_path.exists() {
+        return Ok(ScannedPlugin {
+            name: file_stem(bundle),
+            vendor: None,
+            version: None,
+            category: None,
+            class_id: None,
+            path: bundle.to_path_buf(),
+            format: PluginFormat::Au,
+        });
+    }
+    if let Some((name, vendor, version, category, class_id)) = read_audio_components(&plist_path) {
+        return Ok(ScannedPlugin {
+            name,
+            vendor,
+            version,
+            category,
+            class_id,
+            path: bundle.to_path_buf(),
+            format: PluginFormat::Au,
+        });
+    }
+    // Fallback for V1 AUs without AudioComponents array
+    let (plist_name, version, vendor) = read_info_plist(&plist_path);
+    Ok(ScannedPlugin {
+        name: plist_name.unwrap_or_else(|| file_stem(bundle)),
+        vendor,
+        version,
+        category: None,
+        class_id: None,
+        path: bundle.to_path_buf(),
+        format: PluginFormat::Au,
+    })
+}
+
+/// Extracts plugin info from the `AudioComponents` array in an Info.plist.
+/// Returns (name, vendor, version, category, class_id) on success.
+fn read_audio_components(
+    plist_path: &Path,
+) -> Option<(String, Option<String>, Option<String>, Option<String>, Option<String>)> {
+    let val = plist::Value::from_file(plist_path).ok()?;
+    let dict = val.as_dictionary()?;
+    let comp = dict
+        .get("AudioComponents")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_dictionary())?;
+
+    let full_name = comp.get("name").and_then(|v| v.as_string()).map(str::to_string)?;
+    let (name, vendor) = split_au_name(&full_name);
+
+    let type_code = au_ostype(comp, "type");
+    let subtype   = au_ostype(comp, "subtype");
+    let mfr       = au_ostype(comp, "manufacturer");
+
+    let category = type_code.as_deref().and_then(au_type_to_category).map(str::to_string);
+    let class_id = match (&type_code, &subtype, &mfr) {
+        (Some(t), Some(s), Some(m)) => Some(format!("{t}/{s}/{m}")),
+        _ => None,
+    };
+
+    let version = comp
+        .get("version")
+        .and_then(|v| match v {
+            plist::Value::Integer(i) => i.as_unsigned().map(decode_au_version),
+            plist::Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            dict.get("CFBundleShortVersionString")
+                .and_then(|v| v.as_string())
+                .map(str::to_string)
+        });
+
+    Some((name, vendor, version, category, class_id))
+}
+
+/// Reads an OSType field, handling both string ("aufx") and integer (0x61756678) forms.
+fn au_ostype(dict: &plist::Dictionary, key: &str) -> Option<String> {
+    match dict.get(key)? {
+        plist::Value::String(s) => Some(s.clone()),
+        plist::Value::Integer(i) => {
+            let v = i.as_unsigned()? as u32;
+            let bytes = v.to_be_bytes();
+            if bytes.iter().all(|b| b.is_ascii_graphic()) {
+                Some(String::from_utf8_lossy(&bytes).into_owned())
+            } else {
+                Some(format!("{v:#010x}"))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Splits "Vendor: Plugin Name" into ("Plugin Name", Some("Vendor")).
+/// Returns the full string as name when no ": " separator is present.
+fn split_au_name(full_name: &str) -> (String, Option<String>) {
+    if let Some((vendor, name)) = full_name.split_once(": ") {
+        (name.to_string(), Some(vendor.to_string()))
+    } else {
+        (full_name.to_string(), None)
+    }
+}
+
+/// Maps a 4-char AU type code to a human-readable category.
+fn au_type_to_category(type_code: &str) -> Option<&'static str> {
+    match type_code {
+        "aufx" => Some("Fx"),
+        "aumu" => Some("Instrument"),
+        "aumi" => Some("MIDI Processor"),
+        "auou" => Some("Output"),
+        "aumf" => Some("Mixer"),
+        "aupn" => Some("Panner"),
+        "augn" => Some("Generator"),
+        _ => None,
+    }
+}
+
+/// Decodes an AudioComponents version integer (major<<16 | minor<<8 | patch).
+fn decode_au_version(v: u64) -> String {
+    let major = (v >> 16) & 0xFF;
+    let minor = (v >> 8) & 0xFF;
+    let patch = v & 0xFF;
+    if patch == 0 {
+        format!("{major}.{minor}")
+    } else {
+        format!("{major}.{minor}.{patch}")
+    }
+}
+
+// --- Shared Internals ---
+
 /// Returns (name, version, vendor) from an Info.plist.
 /// All fields are best-effort — parse failures return None rather than errors.
 fn read_info_plist(path: &Path) -> (Option<String>, Option<String>, Option<String>) {
@@ -288,6 +477,8 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    // --- VST3 helpers ---
 
     fn make_bundle(dir: &Path, name: &str, moduleinfo: Option<&str>, plist: Option<&str>) -> PathBuf {
         let bundle = dir.join(format!("{name}.vst3"));
@@ -432,5 +623,115 @@ mod tests {
         );
         assert_eq!(extract_vendor_from_bundle_id("com.apple.coreaudio"), None);
         assert_eq!(extract_vendor_from_bundle_id("notreversedns"), None);
+    }
+
+    // --- AU helpers ---
+
+    fn make_au_bundle(dir: &Path, name: &str, plist: Option<&str>) -> PathBuf {
+        let bundle = dir.join(format!("{name}.component"));
+        fs::create_dir_all(bundle.join("Contents")).unwrap();
+        if let Some(xml) = plist {
+            fs::write(bundle.join("Contents").join("Info.plist"), xml).unwrap();
+        }
+        bundle
+    }
+
+    // 262913 = 0x040301 → major=4, minor=3, patch=1 → "4.3.1"
+    const BATTERY_AU_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleShortVersionString</key><string>4.3.1</string>
+    <key>AudioComponents</key><array><dict>
+        <key>name</key><string>Native Instruments: Battery 4</string>
+        <key>type</key><string>aumu</string>
+        <key>subtype</key><string>Bat4</string>
+        <key>manufacturer</key><string>NInv</string>
+        <key>version</key><integer>262913</integer>
+    </dict></array>
+</dict></plist>"#;
+
+    // 196608 = 0x030000 → major=3, minor=0, patch=0 → "3.0"
+    const PRO_Q_AU_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>AudioComponents</key><array><dict>
+        <key>name</key><string>FabFilter: Pro-Q 3</string>
+        <key>type</key><string>aufx</string>
+        <key>subtype</key><string>FPQ3</string>
+        <key>manufacturer</key><string>FabF</string>
+        <key>version</key><integer>196608</integer>
+    </dict></array>
+</dict></plist>"#;
+
+    #[test]
+    fn parses_au_instrument_bundle() {
+        let tmp = TempDir::new().unwrap();
+        make_au_bundle(tmp.path(), "Battery 4", Some(BATTERY_AU_PLIST));
+
+        let (plugins, errors) = scan_au(&[tmp.path().to_path_buf()]);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(plugins.len(), 1);
+        let p = &plugins[0];
+        assert_eq!(p.name, "Battery 4");
+        assert_eq!(p.vendor.as_deref(), Some("Native Instruments"));
+        assert_eq!(p.version.as_deref(), Some("4.3.1"));
+        assert_eq!(p.category.as_deref(), Some("Instrument"));
+        assert_eq!(p.class_id.as_deref(), Some("aumu/Bat4/NInv"));
+        assert!(matches!(p.format, PluginFormat::Au));
+    }
+
+    #[test]
+    fn parses_au_fx_bundle() {
+        let tmp = TempDir::new().unwrap();
+        make_au_bundle(tmp.path(), "Pro-Q 3", Some(PRO_Q_AU_PLIST));
+
+        let (plugins, errors) = scan_au(&[tmp.path().to_path_buf()]);
+        assert!(errors.is_empty());
+        assert_eq!(plugins.len(), 1);
+        let p = &plugins[0];
+        assert_eq!(p.name, "Pro-Q 3");
+        assert_eq!(p.vendor.as_deref(), Some("FabFilter"));
+        assert_eq!(p.version.as_deref(), Some("3.0"));
+        assert_eq!(p.category.as_deref(), Some("Fx"));
+        assert_eq!(p.class_id.as_deref(), Some("aufx/FPQ3/FabF"));
+    }
+
+    #[test]
+    fn falls_back_to_bundle_name_for_au_without_plist() {
+        let tmp = TempDir::new().unwrap();
+        make_au_bundle(tmp.path(), "Legacy AU", None);
+
+        let (plugins, errors) = scan_au(&[tmp.path().to_path_buf()]);
+        assert!(errors.is_empty());
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "Legacy AU");
+        assert!(plugins[0].vendor.is_none());
+    }
+
+    #[test]
+    fn split_au_name_with_colon_separator() {
+        assert_eq!(
+            split_au_name("Native Instruments: Battery 4"),
+            ("Battery 4".to_string(), Some("Native Instruments".to_string()))
+        );
+        assert_eq!(
+            split_au_name("UnprefixedPlugin"),
+            ("UnprefixedPlugin".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn decode_au_version_formats_correctly() {
+        assert_eq!(decode_au_version(262913), "4.3.1"); // 0x040301
+        assert_eq!(decode_au_version(196608), "3.0");   // 0x030000
+        assert_eq!(decode_au_version(131072), "2.0");   // 0x020000
+    }
+
+    #[test]
+    fn au_type_codes_map_to_categories() {
+        assert_eq!(au_type_to_category("aufx"), Some("Fx"));
+        assert_eq!(au_type_to_category("aumu"), Some("Instrument"));
+        assert_eq!(au_type_to_category("aumi"), Some("MIDI Processor"));
+        assert_eq!(au_type_to_category("xxxx"), None);
     }
 }
