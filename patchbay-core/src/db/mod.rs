@@ -28,6 +28,13 @@ pub struct PluginRecord {
     pub file_mtime: Option<i64>,
 }
 
+pub struct PluginRow {
+    pub name: String,
+    pub vendor: Option<String>,
+    pub format: String,
+    pub category: Option<String>,
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
@@ -68,6 +75,27 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// Return all plugins indexed for this device, sorted by format then name.
+    pub fn list_plugins(&self, device_id: &str) -> Result<Vec<PluginRow>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, vendor, format, category FROM plugins
+             WHERE device_id = ?1
+             ORDER BY format, name COLLATE NOCASE",
+        )?;
+        let rows = stmt
+            .query_map([device_id], |row| {
+                Ok(PluginRow {
+                    name: row.get(0)?,
+                    vendor: row.get(1)?,
+                    format: row.get(2)?,
+                    category: row.get(3)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
     }
 
     /// Return a map of `path → file_mtime` for all indexed plugins on this device

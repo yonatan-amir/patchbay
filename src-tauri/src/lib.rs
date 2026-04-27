@@ -5,6 +5,14 @@ use patchbay_core::db::Database;
 use patchbay_core::{indexer, scanner};
 
 #[derive(Serialize)]
+struct PluginEntry {
+    name: String,
+    vendor: Option<String>,
+    format: String,
+    category: Option<String>,
+}
+
+#[derive(Serialize)]
 struct ScanResult {
     plugins_found: usize,
     plugins_skipped: usize,
@@ -60,6 +68,23 @@ fn scan_plugins(state: tauri::State<'_, Mutex<Database>>) -> Result<ScanResult, 
     })
 }
 
+/// Return all indexed plugins for the current device.
+#[tauri::command]
+fn list_plugins(state: tauri::State<'_, Mutex<Database>>) -> Result<Vec<PluginEntry>, String> {
+    let device_id = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "local".to_string());
+
+    let db = state.lock().map_err(|e| e.to_string())?;
+    let rows = db.list_plugins(&device_id).map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|r| PluginEntry {
+        name: r.name,
+        vendor: r.vendor,
+        format: r.format,
+        category: r.category,
+    }).collect())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -70,7 +95,7 @@ pub fn run() {
             app.manage(Mutex::new(db));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![scan_plugins])
+        .invoke_handler(tauri::generate_handler![scan_plugins, list_plugins])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
