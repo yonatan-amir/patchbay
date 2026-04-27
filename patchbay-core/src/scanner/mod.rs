@@ -269,7 +269,10 @@ fn parse_vst3_bundle(bundle: &Path, file_mtime: Option<i64>) -> Result<ScannedPl
     let moduleinfo_path = bundle.join("Contents").join("moduleinfo.json");
 
     if moduleinfo_path.exists() {
-        return parse_from_moduleinfo(bundle, &moduleinfo_path, file_mtime);
+        if let Ok(p) = parse_from_moduleinfo(bundle, &moduleinfo_path, file_mtime) {
+            return Ok(p);
+        }
+        // malformed/empty moduleinfo.json — fall through to plist/filename
     }
 
     // No moduleinfo.json (true for ~99% of real-world Mac VST3 plugins).
@@ -555,6 +558,18 @@ mod tests {
         assert!(plugins.is_empty());
         assert_eq!(skipped, 0);
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn falls_back_when_moduleinfo_json_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        // Empty moduleinfo.json — should fall back to filename, not error
+        make_bundle(tmp.path(), "Serum", Some(""), None);
+
+        let (plugins, _, errors) = scan_vst3(&[tmp.path().to_path_buf()], &HashMap::new());
+        assert!(errors.is_empty(), "empty moduleinfo.json should not produce an error");
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "Serum");
     }
 
     #[test]
