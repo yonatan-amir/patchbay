@@ -21,6 +21,7 @@ pub fn index_plugins(
             class_id: p.class_id,
             category: p.category,
             device_id: device_id.to_string(),
+            file_mtime: p.file_mtime,
         };
         db.upsert_plugin(&record)?;
         count += 1;

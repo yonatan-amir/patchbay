@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
@@ -24,6 +25,9 @@ pub struct ScannedPlugin {
     pub class_id: Option<String>,
     pub path: PathBuf,
     pub format: PluginFormat,
+    /// Unix timestamp (seconds) of the bundle's last modification time.
+    /// `None` when the filesystem metadata is unavailable (e.g. AU with no resolved path).
+    pub file_mtime: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,13 +159,16 @@ pub fn default_clap_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Scan `paths` for CLAP plugins, optionally probing each binary for metadata.
+/// Walk `paths` for CLAP plugins, probing each binary for metadata when a probe binary is available.
 ///
-/// Uses the `patchbay-clap-probe` sidecar binary when available. Pass the
-/// result of `clap::find_probe()` or `None` to skip metadata extraction.
-/// One `.clap` bundle may yield multiple `ScannedPlugin`s.
-pub fn scan_clap(paths: &[PathBuf], probe: Option<&std::path::Path>) -> (Vec<ScannedPlugin>, Vec<ScanError>) {
-    clap::scan_clap(paths, probe)
+/// Returns `(plugins, skipped, errors)` where `skipped` is the number of bundles whose
+/// mtime matched `known_mtimes` and were not re-parsed.
+pub fn scan_clap(
+    paths: &[PathBuf],
+    probe: Option<&std::path::Path>,
+    known_mtimes: &HashMap<String, i64>,
+) -> (Vec<ScannedPlugin>, usize, Vec<ScanError>) {
+    clap::scan_clap(paths, probe, known_mtimes)
 }
 
 /// Walk `paths` for `.clap` bundle entries without loading any plugin code.
@@ -169,12 +176,16 @@ pub fn walk_clap_bundles(paths: &[PathBuf]) -> Vec<PathBuf> {
     clap::walk_clap_bundles(paths)
 }
 
-/// Scan `paths` for VST2 plugins, optionally probing each binary for metadata.
+/// Walk `paths` for VST2 plugins, probing each binary for metadata when a probe binary is available.
 ///
-/// Uses the `patchbay-vst2-probe` sidecar binary when available. Pass the
-/// result of `vst2::find_probe()` or `None` to skip metadata extraction.
-pub fn scan_vst2(paths: &[PathBuf], probe: Option<&std::path::Path>) -> (Vec<ScannedPlugin>, Vec<ScanError>) {
-    vst2::scan_vst2(paths, probe)
+/// Returns `(plugins, skipped, errors)` where `skipped` is the number of bundles whose
+/// mtime matched `known_mtimes` and were not re-parsed.
+pub fn scan_vst2(
+    paths: &[PathBuf],
+    probe: Option<&std::path::Path>,
+    known_mtimes: &HashMap<String, i64>,
+) -> (Vec<ScannedPlugin>, usize, Vec<ScanError>) {
+    vst2::scan_vst2(paths, probe, known_mtimes)
 }
 
 /// Walk `paths` for `.vst` bundle directories (macOS) or `.dll` files (Windows)
@@ -184,26 +195,34 @@ pub fn walk_vst2_bundles(paths: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// Walk `paths`, find every `.vst3` bundle, parse metadata.
-/// Returns (successful results, non-fatal errors) so callers see partial progress.
-pub fn scan_vst3(paths: &[PathBuf]) -> (Vec<ScannedPlugin>, Vec<ScanError>) {
+///
+/// Bundles whose path is in `known_mtimes` with a matching mtime are skipped.
+/// Returns `(plugins, skipped, errors)`.
+pub fn scan_vst3(
+    paths: &[PathBuf],
+    known_mtimes: &HashMap<String, i64>,
+) -> (Vec<ScannedPlugin>, usize, Vec<ScanError>) {
     let mut plugins = Vec::new();
     let mut errors = Vec::new();
+    let mut skipped = 0;
 
     for root in paths {
         if !root.exists() {
             continue;
         }
-        collect_bundles(root, &mut plugins, &mut errors);
+        collect_bundles(root, known_mtimes, &mut plugins, &mut skipped, &mut errors);
     }
 
-    (plugins, errors)
+    (plugins, skipped, errors)
 }
 
 // --- VST3 Internals ---
 
 fn collect_bundles(
     dir: &Path,
+    known_mtimes: &HashMap<String, i64>,
     plugins: &mut Vec<ScannedPlugin>,
+    skipped: &mut usize,
     errors: &mut Vec<ScanError>,
 ) {
     let entries = match std::fs::read_dir(dir) {
@@ -217,22 +236,30 @@ fn collect_bundles(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().map(|e| e.eq_ignore_ascii_case("vst3")).unwrap_or(false) {
-            match parse_vst3_bundle(&path) {
+            let current_mtime = bundle_mtime(&path);
+            let path_key = path.to_string_lossy();
+            if let (Some(&known), Some(current)) = (known_mtimes.get(path_key.as_ref()), current_mtime) {
+                if known == current {
+                    *skipped += 1;
+                    continue;
+                }
+            }
+            match parse_vst3_bundle(&path, current_mtime) {
                 Ok(p) => plugins.push(p),
                 Err(e) => errors.push(e),
             }
         } else if path.is_dir() {
             // Vendors often nest plugins one level deep (e.g. "Fabfilter/FabFilter Pro-Q 3.vst3")
-            collect_bundles(&path, plugins, errors);
+            collect_bundles(&path, known_mtimes, plugins, skipped, errors);
         }
     }
 }
 
-fn parse_vst3_bundle(bundle: &Path) -> Result<ScannedPlugin, ScanError> {
+fn parse_vst3_bundle(bundle: &Path, file_mtime: Option<i64>) -> Result<ScannedPlugin, ScanError> {
     let moduleinfo_path = bundle.join("Contents").join("moduleinfo.json");
 
     if moduleinfo_path.exists() {
-        return parse_from_moduleinfo(bundle, &moduleinfo_path);
+        return parse_from_moduleinfo(bundle, &moduleinfo_path, file_mtime);
     }
 
     // No moduleinfo.json (true for ~99% of real-world Mac VST3 plugins).
@@ -252,10 +279,15 @@ fn parse_vst3_bundle(bundle: &Path) -> Result<ScannedPlugin, ScanError> {
         class_id: None,
         path: bundle.to_path_buf(),
         format: PluginFormat::Vst3,
+        file_mtime,
     })
 }
 
-fn parse_from_moduleinfo(bundle: &Path, path: &Path) -> Result<ScannedPlugin, ScanError> {
+fn parse_from_moduleinfo(
+    bundle: &Path,
+    path: &Path,
+    file_mtime: Option<i64>,
+) -> Result<ScannedPlugin, ScanError> {
     let data = std::fs::read_to_string(path)
         .map_err(|e| ScanError::Io { path: path.to_path_buf(), source: e })?;
 
@@ -294,24 +326,37 @@ fn parse_from_moduleinfo(bundle: &Path, path: &Path) -> Result<ScannedPlugin, Sc
         class_id,
         path: bundle.to_path_buf(),
         format: PluginFormat::Vst3,
+        file_mtime,
     })
 }
 
 // --- AU Public API ---
 
 /// Enumerate all AudioUnits registered with the CoreAudio component registry.
-/// On non-macOS platforms returns empty (AUs are macOS-only).
+/// AU registry queries are fast; all AUs are always re-scanned (no mtime skip).
+/// On non-macOS platforms returns empty.
 #[cfg(target_os = "macos")]
-pub fn scan_au() -> (Vec<ScannedPlugin>, Vec<ScanError>) {
-    au::scan_au_registry()
+pub fn scan_au() -> (Vec<ScannedPlugin>, usize, Vec<ScanError>) {
+    let (plugins, errors) = au::scan_au_registry();
+    (plugins, 0, errors)
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn scan_au() -> (Vec<ScannedPlugin>, Vec<ScanError>) {
-    (Vec::new(), Vec::new())
+pub fn scan_au() -> (Vec<ScannedPlugin>, usize, Vec<ScanError>) {
+    (Vec::new(), 0, Vec::new())
 }
 
 // --- Shared Internals ---
+
+/// Read the filesystem mtime for `path` as a Unix timestamp in seconds.
+/// Returns `None` if the metadata is unavailable.
+pub(crate) fn bundle_mtime(path: &Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+}
 
 /// Returns (name, version, vendor) from an Info.plist.
 /// All fields are best-effort — parse failures return None rather than errors.
@@ -443,9 +488,10 @@ mod tests {
             }]
         }"#), None);
 
-        let (plugins, errors) = scan_vst3(&[tmp.path().to_path_buf()]);
+        let (plugins, skipped, errors) = scan_vst3(&[tmp.path().to_path_buf()], &HashMap::new());
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert_eq!(plugins.len(), 1);
+        assert_eq!(skipped, 0);
         let p = &plugins[0];
         assert_eq!(p.name, "Test Plugin");
         assert_eq!(p.vendor.as_deref(), Some("Acme Audio"));
@@ -459,7 +505,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         make_bundle(tmp.path(), "Battery 4", None, Some(BATTERY_PLIST));
 
-        let (plugins, errors) = scan_vst3(&[tmp.path().to_path_buf()]);
+        let (plugins, _, errors) = scan_vst3(&[tmp.path().to_path_buf()], &HashMap::new());
         assert!(errors.is_empty());
         assert_eq!(plugins.len(), 1);
         let p = &plugins[0];
@@ -473,7 +519,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         make_bundle(tmp.path(), "AMEK Mastering Compressor", None, Some(AMEK_PLIST));
 
-        let (plugins, errors) = scan_vst3(&[tmp.path().to_path_buf()]);
+        let (plugins, _, errors) = scan_vst3(&[tmp.path().to_path_buf()], &HashMap::new());
         assert!(errors.is_empty());
         assert_eq!(plugins.len(), 1);
         let p = &plugins[0];
@@ -486,7 +532,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         make_bundle(tmp.path(), "Legacy Plugin", None, None);
 
-        let (plugins, errors) = scan_vst3(&[tmp.path().to_path_buf()]);
+        let (plugins, _, errors) = scan_vst3(&[tmp.path().to_path_buf()], &HashMap::new());
         assert!(errors.is_empty());
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "Legacy Plugin");
@@ -495,8 +541,9 @@ mod tests {
 
     #[test]
     fn skips_nonexistent_paths() {
-        let (plugins, errors) = scan_vst3(&[PathBuf::from("/does/not/exist/VST3")]);
+        let (plugins, skipped, errors) = scan_vst3(&[PathBuf::from("/does/not/exist/VST3")], &HashMap::new());
         assert!(plugins.is_empty());
+        assert_eq!(skipped, 0);
         assert!(errors.is_empty());
     }
 
@@ -511,10 +558,55 @@ mod tests {
             "Classes": [{ "CID": "AABB", "Name": "Pro-Q 3", "Sub Categories": ["Fx", "EQ"] }]
         }"#), None);
 
-        let (plugins, errors) = scan_vst3(&[tmp.path().to_path_buf()]);
+        let (plugins, _, errors) = scan_vst3(&[tmp.path().to_path_buf()], &HashMap::new());
         assert!(errors.is_empty());
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "Pro-Q 3");
+    }
+
+    #[test]
+    fn vst3_records_file_mtime() {
+        let tmp = TempDir::new().unwrap();
+        make_bundle(tmp.path(), "TestPlugin", None, None);
+
+        let (plugins, _, _) = scan_vst3(&[tmp.path().to_path_buf()], &HashMap::new());
+        assert_eq!(plugins.len(), 1);
+        assert!(plugins[0].file_mtime.is_some(), "expected file_mtime to be set");
+        assert!(plugins[0].file_mtime.unwrap() > 0);
+    }
+
+    #[test]
+    fn skips_unchanged_vst3_by_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = make_bundle(tmp.path(), "TestPlugin", None, None);
+
+        // First scan: nothing known — plugin is returned
+        let (plugins, skipped, _) = scan_vst3(&[tmp.path().to_path_buf()], &HashMap::new());
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(skipped, 0);
+
+        // Build known_mtimes with the current mtime
+        let current_mtime = bundle_mtime(&bundle).unwrap();
+        let mut known = HashMap::new();
+        known.insert(bundle.to_string_lossy().into_owned(), current_mtime);
+
+        let (plugins, skipped, _) = scan_vst3(&[tmp.path().to_path_buf()], &known);
+        assert_eq!(plugins.len(), 0, "unchanged bundle should be skipped");
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn rescans_vst3_when_mtime_changes() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = make_bundle(tmp.path(), "TestPlugin", None, None);
+
+        // Stale mtime (epoch 0 is always in the past)
+        let mut known = HashMap::new();
+        known.insert(bundle.to_string_lossy().into_owned(), 0i64);
+
+        let (plugins, skipped, _) = scan_vst3(&[tmp.path().to_path_buf()], &known);
+        assert_eq!(plugins.len(), 1, "changed mtime should trigger re-parse");
+        assert_eq!(skipped, 0);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //!     times out, or the probe binary is absent, the scanner falls back to
 //!     Info.plist + filename metadata.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc;
@@ -21,17 +22,32 @@ use super::{PluginFormat, ScanError, ScannedPlugin};
 
 /// Scan `paths` for VST2 plugins.
 ///
-/// `probe` is the path to the `patchbay-vst2-probe` binary. Pass `None` to
-/// skip step 2 (metadata will come from Info.plist / filename only).
-pub fn scan_vst2(paths: &[PathBuf], probe: Option<&Path>) -> (Vec<ScannedPlugin>, Vec<ScanError>) {
+/// Bundles whose path appears in `known_mtimes` with a matching mtime are skipped
+/// without spawning the probe subprocess.
+///
+/// Returns `(plugins, skipped, errors)`.
+pub fn scan_vst2(
+    paths: &[PathBuf],
+    probe: Option<&Path>,
+    known_mtimes: &HashMap<String, i64>,
+) -> (Vec<ScannedPlugin>, usize, Vec<ScanError>) {
     let mut plugins = Vec::new();
+    let mut skipped = 0;
 
     for bundle in walk_vst_bundles(paths) {
+        let current_mtime = super::bundle_mtime(&bundle);
+        let path_key = bundle.to_string_lossy();
+        if let (Some(&known), Some(current)) = (known_mtimes.get(path_key.as_ref()), current_mtime) {
+            if known == current {
+                skipped += 1;
+                continue;
+            }
+        }
         let probe_out = probe.and_then(|p| run_probe(p, &bundle));
-        plugins.push(build_plugin(&bundle, probe_out));
+        plugins.push(build_plugin(&bundle, probe_out, current_mtime));
     }
 
-    (plugins, Vec::new())
+    (plugins, skipped, Vec::new())
 }
 
 /// Locate the `patchbay-vst2-probe` binary next to the current executable.
@@ -124,7 +140,7 @@ fn run_probe(probe: &Path, bundle: &Path) -> Option<ProbeOutput> {
 
 // -- plugin assembly ----------------------------------------------------------
 
-fn build_plugin(bundle: &Path, probe: Option<ProbeOutput>) -> ScannedPlugin {
+fn build_plugin(bundle: &Path, probe: Option<ProbeOutput>, file_mtime: Option<i64>) -> ScannedPlugin {
     let plist_path = bundle.join("Contents").join("Info.plist");
     let (plist_name, plist_version, plist_vendor) = if plist_path.exists() {
         super::read_info_plist(&plist_path)
@@ -162,6 +178,7 @@ fn build_plugin(bundle: &Path, probe: Option<ProbeOutput>) -> ScannedPlugin {
         class_id: None,
         path: bundle.to_path_buf(),
         format: PluginFormat::Vst2,
+        file_mtime,
     }
 }
 
@@ -196,6 +213,7 @@ fn probe_name() -> &'static str { "patchbay-vst2-probe" }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::bundle_mtime;
     use std::fs;
     use tempfile::TempDir;
 
@@ -245,7 +263,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bundle = make_vst_bundle(tmp.path(), "Battery 4", Some(BATTERY_PLIST));
 
-        let plugin = build_plugin(&bundle, None);
+        let plugin = build_plugin(&bundle, None, None);
         assert_eq!(plugin.name, "Battery 4");
         assert_eq!(plugin.version.as_deref(), Some("4.3.1"));
         assert_eq!(plugin.vendor.as_deref(), Some("Native Instruments GmbH"));
@@ -258,7 +276,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bundle = make_vst_bundle(tmp.path(), "Serum", None);
 
-        let plugin = build_plugin(&bundle, None);
+        let plugin = build_plugin(&bundle, None, None);
         assert_eq!(plugin.name, "Serum");
         assert!(plugin.vendor.is_none());
         assert!(plugin.version.is_none());
@@ -275,7 +293,7 @@ mod tests {
             category: Some(2),
         };
 
-        let plugin = build_plugin(&bundle, Some(probe_out));
+        let plugin = build_plugin(&bundle, Some(probe_out), None);
         assert_eq!(plugin.name, "Battery 4 (VST2)");
         assert_eq!(plugin.vendor.as_deref(), Some("Native Instruments"));
         assert_eq!(plugin.category.as_deref(), Some("Synth"));
@@ -293,7 +311,7 @@ mod tests {
             category: Some(1),
         };
 
-        let plugin = build_plugin(&bundle, Some(probe_out));
+        let plugin = build_plugin(&bundle, Some(probe_out), None);
         assert_eq!(plugin.name, "Battery 4");
     }
 
@@ -303,5 +321,48 @@ mod tests {
         assert_eq!(vst_category_str(2), "Synth");
         assert_eq!(vst_category_str(0), "Unknown");
         assert_eq!(vst_category_str(99), "Unknown");
+    }
+
+    #[test]
+    fn build_plugin_stores_file_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = make_vst_bundle(tmp.path(), "Serum", None);
+        let mtime = bundle_mtime(&bundle);
+        assert!(mtime.is_some());
+        let plugin = build_plugin(&bundle, None, mtime);
+        assert_eq!(plugin.file_mtime, mtime);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn skips_unchanged_vst2_by_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = make_vst_bundle(tmp.path(), "Serum", None);
+
+        // First scan: nothing known — plugin is returned
+        let (plugins, skipped, _) = scan_vst2(&[tmp.path().to_path_buf()], None, &HashMap::new());
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(skipped, 0);
+
+        // Second scan: mtime matches — bundle is skipped
+        let current = bundle_mtime(&bundle).unwrap();
+        let mut known = HashMap::new();
+        known.insert(bundle.to_string_lossy().into_owned(), current);
+        let (plugins, skipped, _) = scan_vst2(&[tmp.path().to_path_buf()], None, &known);
+        assert_eq!(plugins.len(), 0);
+        assert_eq!(skipped, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rescans_vst2_when_mtime_changes() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = make_vst_bundle(tmp.path(), "Serum", None);
+
+        let mut known = HashMap::new();
+        known.insert(bundle.to_string_lossy().into_owned(), 0i64);
+        let (plugins, skipped, _) = scan_vst2(&[tmp.path().to_path_buf()], None, &known);
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(skipped, 0);
     }
 }

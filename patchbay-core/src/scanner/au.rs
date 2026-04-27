@@ -221,6 +221,11 @@ pub fn scan_au_registry() -> (Vec<ScannedPlugin>, Vec<ScanError>) {
         };
 
         let path = path_index.get(&class_id).cloned().unwrap_or_default();
+        let file_mtime = if path == std::path::PathBuf::new() {
+            None
+        } else {
+            super::bundle_mtime(&path)
+        };
         plugins.push(ScannedPlugin {
             name,
             vendor,
@@ -229,6 +234,7 @@ pub fn scan_au_registry() -> (Vec<ScannedPlugin>, Vec<ScanError>) {
             class_id: Some(class_id),
             path,
             format: PluginFormat::Au,
+            file_mtime,
         });
     }
 

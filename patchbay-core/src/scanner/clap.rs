@@ -11,6 +11,7 @@
 //! When the probe is absent, crashes, or times out, we fall back to bundle
 //! filename and Info.plist (macOS) for a single best-effort record.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc;
@@ -24,17 +25,32 @@ use super::{PluginFormat, ScanError, ScannedPlugin};
 
 /// Scan `paths` for CLAP plugins.
 ///
-/// `probe` is the path to the `patchbay-clap-probe` binary. Pass `None` to
-/// skip the probe step (metadata will come from Info.plist / filename only).
-pub fn scan_clap(paths: &[PathBuf], probe: Option<&Path>) -> (Vec<ScannedPlugin>, Vec<ScanError>) {
+/// Bundles whose path appears in `known_mtimes` with a matching mtime are skipped
+/// without spawning the probe subprocess.
+///
+/// Returns `(plugins, skipped, errors)`.
+pub fn scan_clap(
+    paths: &[PathBuf],
+    probe: Option<&Path>,
+    known_mtimes: &HashMap<String, i64>,
+) -> (Vec<ScannedPlugin>, usize, Vec<ScanError>) {
     let mut plugins = Vec::new();
+    let mut skipped = 0;
 
     for bundle in walk_clap_bundles(paths) {
+        let current_mtime = super::bundle_mtime(&bundle);
+        let path_key = bundle.to_string_lossy();
+        if let (Some(&known), Some(current)) = (known_mtimes.get(path_key.as_ref()), current_mtime) {
+            if known == current {
+                skipped += 1;
+                continue;
+            }
+        }
         let descriptors = probe.and_then(|p| run_probe(p, &bundle));
-        extend_plugins(&bundle, descriptors, &mut plugins);
+        extend_plugins(&bundle, descriptors, current_mtime, &mut plugins);
     }
 
-    (plugins, Vec::new())
+    (plugins, skipped, Vec::new())
 }
 
 /// Locate the `patchbay-clap-probe` binary next to the current executable.
@@ -127,18 +143,23 @@ fn run_probe(probe: &Path, bundle: &Path) -> Option<Vec<ProbeDescriptor>> {
 
 /// Push one `ScannedPlugin` per probe descriptor. Falls back to a single
 /// filename/plist record when descriptors are absent or empty.
-fn extend_plugins(bundle: &Path, probe: Option<Vec<ProbeDescriptor>>, out: &mut Vec<ScannedPlugin>) {
+fn extend_plugins(
+    bundle: &Path,
+    probe: Option<Vec<ProbeDescriptor>>,
+    file_mtime: Option<i64>,
+    out: &mut Vec<ScannedPlugin>,
+) {
     match probe {
         Some(descs) if !descs.is_empty() => {
             for desc in descs {
-                out.push(build_from_probe(bundle, desc));
+                out.push(build_from_probe(bundle, desc, file_mtime));
             }
         }
-        _ => out.push(build_fallback(bundle)),
+        _ => out.push(build_fallback(bundle, file_mtime)),
     }
 }
 
-fn build_from_probe(bundle: &Path, desc: ProbeDescriptor) -> ScannedPlugin {
+fn build_from_probe(bundle: &Path, desc: ProbeDescriptor, file_mtime: Option<i64>) -> ScannedPlugin {
     let (plist_name, plist_version, plist_vendor) = plist_metadata(bundle);
 
     let name = desc
@@ -166,10 +187,11 @@ fn build_from_probe(bundle: &Path, desc: ProbeDescriptor) -> ScannedPlugin {
         class_id,
         path: bundle.to_path_buf(),
         format: PluginFormat::Clap,
+        file_mtime,
     }
 }
 
-fn build_fallback(bundle: &Path) -> ScannedPlugin {
+fn build_fallback(bundle: &Path, file_mtime: Option<i64>) -> ScannedPlugin {
     let (name, version, vendor) = plist_metadata(bundle);
     ScannedPlugin {
         name: name.unwrap_or_else(|| super::file_stem(bundle)),
@@ -179,6 +201,7 @@ fn build_fallback(bundle: &Path) -> ScannedPlugin {
         class_id: None,
         path: bundle.to_path_buf(),
         format: PluginFormat::Clap,
+        file_mtime,
     }
 }
 
@@ -205,6 +228,8 @@ fn probe_name() -> &'static str { "patchbay-clap-probe" }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::scanner::bundle_mtime;
     use std::fs;
     use tempfile::TempDir;
 
@@ -254,7 +279,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bundle = make_clap_bundle(tmp.path(), "FabFilter Pro-Q 3", Some(PRO_Q_PLIST));
 
-        let plugin = build_fallback(&bundle);
+        let plugin = build_fallback(&bundle, None);
         assert_eq!(plugin.name, "FabFilter Pro-Q 3");
         assert_eq!(plugin.version.as_deref(), Some("3.22"));
         assert_eq!(plugin.vendor.as_deref(), Some("FabFilter"));
@@ -267,7 +292,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bundle = make_clap_bundle(tmp.path(), "Serum 2", None);
 
-        let plugin = build_fallback(&bundle);
+        let plugin = build_fallback(&bundle, None);
         assert_eq!(plugin.name, "Serum 2");
         assert!(plugin.vendor.is_none());
         assert!(plugin.version.is_none());
@@ -287,7 +312,7 @@ mod tests {
             features: vec!["audio-effect".to_string(), "equalizer".to_string()],
         };
 
-        let plugin = build_from_probe(&bundle, desc);
+        let plugin = build_from_probe(&bundle, desc, None);
         assert_eq!(plugin.name, "FabFilter Pro-Q 3");
         assert_eq!(plugin.vendor.as_deref(), Some("FabFilter"));
         assert_eq!(plugin.version.as_deref(), Some("3.22.0"));
@@ -310,7 +335,7 @@ mod tests {
             features: vec![],
         };
 
-        let plugin = build_from_probe(&bundle, desc);
+        let plugin = build_from_probe(&bundle, desc, None);
         assert_eq!(plugin.name, "Serum 2");
         assert!(plugin.vendor.is_none());
         assert!(plugin.category.is_none());
@@ -324,7 +349,7 @@ mod tests {
         fs::create_dir_all(&bundle).unwrap();
 
         let mut plugins = Vec::new();
-        extend_plugins(&bundle, Some(vec![]), &mut plugins);
+        extend_plugins(&bundle, Some(vec![]), None, &mut plugins);
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "Serum 2");
     }
@@ -336,7 +361,7 @@ mod tests {
         fs::create_dir_all(&bundle).unwrap();
 
         let mut plugins = Vec::new();
-        extend_plugins(&bundle, None, &mut plugins);
+        extend_plugins(&bundle, None, None, &mut plugins);
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "Massive X");
     }
@@ -365,11 +390,59 @@ mod tests {
         ];
 
         let mut plugins = Vec::new();
-        extend_plugins(&bundle, Some(descs), &mut plugins);
+        extend_plugins(&bundle, Some(descs), None, &mut plugins);
         assert_eq!(plugins.len(), 2);
         assert_eq!(plugins[0].name, "Plugin A");
         assert_eq!(plugins[0].category.as_deref(), Some("audio-effect"));
         assert_eq!(plugins[1].name, "Plugin B");
         assert_eq!(plugins[1].category.as_deref(), Some("instrument|synthesizer"));
+    }
+
+    #[test]
+    fn file_mtime_is_threaded_through_probe() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("TestPlugin.clap");
+        fs::create_dir_all(&bundle).unwrap();
+
+        let desc = ProbeDescriptor {
+            id: None,
+            name: Some("Test".to_string()),
+            vendor: None,
+            version: None,
+            features: vec![],
+        };
+        let plugin = build_from_probe(&bundle, desc, Some(9999));
+        assert_eq!(plugin.file_mtime, Some(9999));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn skips_unchanged_clap_by_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = make_clap_bundle(tmp.path(), "Pro-Q 3", None);
+
+        let (plugins, skipped, _) = scan_clap(&[tmp.path().to_path_buf()], None, &HashMap::new());
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(skipped, 0);
+
+        let current = bundle_mtime(&bundle).unwrap();
+        let mut known = HashMap::new();
+        known.insert(bundle.to_string_lossy().into_owned(), current);
+        let (plugins, skipped, _) = scan_clap(&[tmp.path().to_path_buf()], None, &known);
+        assert_eq!(plugins.len(), 0);
+        assert_eq!(skipped, 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rescans_clap_when_mtime_changes() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = make_clap_bundle(tmp.path(), "Pro-Q 3", None);
+
+        let mut known = HashMap::new();
+        known.insert(bundle.to_string_lossy().into_owned(), 0i64);
+        let (plugins, skipped, _) = scan_clap(&[tmp.path().to_path_buf()], None, &known);
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(skipped, 0);
     }
 }

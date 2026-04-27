@@ -8,9 +8,9 @@ fn main() {
     }
     println!();
 
-    let (plugins, errors) = scanner::scan_vst3(&paths);
+    let (plugins, skipped, errors) = scanner::scan_vst3(&paths, &std::collections::HashMap::new());
 
-    println!("Found {} plugins:\n", plugins.len());
+    println!("Found {} plugins ({} skipped — unchanged since last scan):\n", plugins.len(), skipped);
     for p in &plugins {
         println!(
             "  [{:6}] {:<40} | vendor: {:<30} | version: {}",

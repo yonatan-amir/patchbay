@@ -201,4 +201,8 @@ Migration {
         CREATE INDEX idx_chain_forks_source       ON chain_forks(source_chain_id);
         CREATE INDEX idx_chain_forks_forked       ON chain_forks(forked_chain_id);
     ",
+},
+Migration {
+    version: 4,
+    sql: "ALTER TABLE plugins ADD COLUMN file_mtime INTEGER;",
 }];
