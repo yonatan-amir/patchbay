@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import PluginDetail from "./views/PluginDetail";
 
 interface Plugin {
   name: string;
@@ -27,6 +28,7 @@ export default function App() {
   const [lastScan, setLastScan] = useState<ScanResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
+  const [selectedPlugin, setSelectedPlugin] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<Plugin[]>("list_plugins")
@@ -47,6 +49,14 @@ export default function App() {
     } finally {
       setScanning(false);
     }
+  }
+
+  if (selectedPlugin !== null) {
+    return (
+      <div className="flex flex-col h-screen bg-zinc-950 text-zinc-100 font-mono text-sm">
+        <PluginDetail name={selectedPlugin} onBack={() => setSelectedPlugin(null)} />
+      </div>
+    );
   }
 
   const visible = filter
@@ -133,7 +143,8 @@ export default function App() {
               {visible.map((p, i) => (
                 <tr
                   key={i}
-                  className="border-b border-zinc-900 hover:bg-zinc-900/50"
+                  onClick={() => setSelectedPlugin(p.name)}
+                  className="border-b border-zinc-900 hover:bg-zinc-900/50 cursor-pointer"
                 >
                   <td className="px-4 py-1.5 text-zinc-600">{i + 1}</td>
                   <td className="px-4 py-1.5">{p.name}</td>

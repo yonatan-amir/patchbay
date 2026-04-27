@@ -35,6 +35,28 @@ pub struct PluginRow {
     pub category: Option<String>,
 }
 
+pub struct PluginFormatInstance {
+    pub format: String,
+    pub path: String,
+    pub version: Option<String>,
+}
+
+pub struct PluginManual {
+    pub id: i64,
+    pub source: String,
+    pub path_or_url: String,
+}
+
+pub struct PluginDetail {
+    pub id: i64,
+    pub name: String,
+    pub vendor: Option<String>,
+    pub category: Option<String>,
+    pub instances: Vec<PluginFormatInstance>,
+    pub note: String,
+    pub manuals: Vec<PluginManual>,
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
@@ -95,6 +117,126 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    /// Return all format instances for a plugin name, plus user note and manuals.
+    /// Groups every row with matching name (VST3 + AU + VST2 may all exist).
+    /// The primary row (lowest id) is used as the anchor for notes and manuals.
+    pub fn get_plugin_detail(&self, name: &str, device_id: &str) -> Result<Option<PluginDetail>, DbError> {
+        struct Row {
+            id: i64,
+            vendor: Option<String>,
+            format: String,
+            path: String,
+            version: Option<String>,
+            category: Option<String>,
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, vendor, format, path, version, category
+             FROM plugins
+             WHERE name = ?1 AND device_id = ?2
+             ORDER BY id ASC",
+        )?;
+
+        let rows: Vec<Row> = stmt
+            .query_map(rusqlite::params![name, device_id], |row| {
+                Ok(Row {
+                    id: row.get(0)?,
+                    vendor: row.get(1)?,
+                    format: row.get(2)?,
+                    path: row.get(3)?,
+                    version: row.get(4)?,
+                    category: row.get(5)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let primary_id = rows[0].id;
+        let vendor = rows[0].vendor.clone();
+        let category = rows[0].category.clone();
+
+        let instances = rows
+            .into_iter()
+            .map(|r| PluginFormatInstance {
+                format: r.format,
+                path: r.path,
+                version: r.version,
+            })
+            .collect();
+
+        // No row → empty note (QueryReturnedNoRows is expected when no note exists).
+        let note: String = self
+            .conn
+            .query_row(
+                "SELECT body FROM plugin_notes WHERE plugin_id = ?1",
+                [primary_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+
+        let mut manual_stmt = self.conn.prepare(
+            "SELECT id, source, path_or_url FROM plugin_manuals
+             WHERE plugin_id = ?1
+             ORDER BY id",
+        )?;
+        let manuals: Vec<PluginManual> = manual_stmt
+            .query_map([primary_id], |row| {
+                Ok(PluginManual {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    path_or_url: row.get(2)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(Some(PluginDetail {
+            id: primary_id,
+            name: name.to_string(),
+            vendor,
+            category,
+            instances,
+            note,
+            manuals,
+        }))
+    }
+
+    /// Insert or replace the user note for a plugin row.
+    pub fn upsert_plugin_note(&self, plugin_id: i64, body: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO plugin_notes (plugin_id, body, updated_at)
+             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+             ON CONFLICT(plugin_id) DO UPDATE SET
+                 body       = excluded.body,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            rusqlite::params![plugin_id, body],
+        )?;
+        Ok(())
+    }
+
+    /// Attach a manual reference (URL or local path) to a plugin row.
+    /// Returns the new manual's row id.
+    pub fn save_plugin_manual(&self, plugin_id: i64, source: &str, path_or_url: &str) -> Result<i64, DbError> {
+        self.conn.execute(
+            "INSERT INTO plugin_manuals (plugin_id, source, path_or_url) VALUES (?1, ?2, ?3)",
+            rusqlite::params![plugin_id, source, path_or_url],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Remove a manual entry by its id.
+    pub fn delete_plugin_manual(&self, manual_id: i64) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM plugin_manuals WHERE id = ?1",
+            [manual_id],
+        )?;
+        Ok(())
     }
 
     /// Return a map of `path → file_mtime` for all indexed plugins on this device
@@ -208,5 +350,98 @@ mod tests {
         let mtimes_dev2 = db.get_known_mtimes("dev2").unwrap();
         assert_eq!(mtimes_dev1.len(), 1);
         assert_eq!(mtimes_dev2.len(), 0);
+    }
+
+    #[test]
+    fn get_plugin_detail_groups_formats() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_plugin(&PluginRecord {
+            sync_id: "vst3-1".to_string(),
+            name: "Pro-Q 3".to_string(),
+            vendor: Some("FabFilter".to_string()),
+            format: "VST3".to_string(),
+            path: "/plugins/Pro-Q 3.vst3".to_string(),
+            version: Some("3.56".to_string()),
+            class_id: None,
+            category: Some("EQ".to_string()),
+            device_id: "dev1".to_string(),
+            file_mtime: None,
+        }).unwrap();
+        db.upsert_plugin(&PluginRecord {
+            sync_id: "au-1".to_string(),
+            name: "Pro-Q 3".to_string(),
+            vendor: Some("FabFilter".to_string()),
+            format: "AU".to_string(),
+            path: "/plugins/Pro-Q 3.component".to_string(),
+            version: Some("3.56".to_string()),
+            class_id: Some("FabF:PrQ3:au  :".to_string()),
+            category: Some("EQ".to_string()),
+            device_id: "dev1".to_string(),
+            file_mtime: None,
+        }).unwrap();
+
+        let detail = db.get_plugin_detail("Pro-Q 3", "dev1").unwrap().unwrap();
+        assert_eq!(detail.name, "Pro-Q 3");
+        assert_eq!(detail.vendor.as_deref(), Some("FabFilter"));
+        assert_eq!(detail.instances.len(), 2);
+        assert!(detail.instances.iter().any(|i| i.format == "VST3"));
+        assert!(detail.instances.iter().any(|i| i.format == "AU"));
+        assert_eq!(detail.note, "");
+    }
+
+    #[test]
+    fn upsert_plugin_note_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_plugin(&PluginRecord {
+            sync_id: "x".to_string(),
+            name: "TestPlugin".to_string(),
+            vendor: None,
+            format: "VST3".to_string(),
+            path: "/p/x.vst3".to_string(),
+            version: None,
+            class_id: None,
+            category: None,
+            device_id: "dev1".to_string(),
+            file_mtime: None,
+        }).unwrap();
+
+        let detail = db.get_plugin_detail("TestPlugin", "dev1").unwrap().unwrap();
+        db.upsert_plugin_note(detail.id, "Great reverb tail").unwrap();
+
+        let detail2 = db.get_plugin_detail("TestPlugin", "dev1").unwrap().unwrap();
+        assert_eq!(detail2.note, "Great reverb tail");
+
+        // overwrite
+        db.upsert_plugin_note(detail.id, "Updated note").unwrap();
+        let detail3 = db.get_plugin_detail("TestPlugin", "dev1").unwrap().unwrap();
+        assert_eq!(detail3.note, "Updated note");
+    }
+
+    #[test]
+    fn save_and_delete_plugin_manual() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_plugin(&PluginRecord {
+            sync_id: "y".to_string(),
+            name: "TestPlugin".to_string(),
+            vendor: None,
+            format: "VST3".to_string(),
+            path: "/p/y.vst3".to_string(),
+            version: None,
+            class_id: None,
+            category: None,
+            device_id: "dev1".to_string(),
+            file_mtime: None,
+        }).unwrap();
+
+        let detail = db.get_plugin_detail("TestPlugin", "dev1").unwrap().unwrap();
+        let mid = db.save_plugin_manual(detail.id, "url", "https://example.com/manual.pdf").unwrap();
+
+        let detail2 = db.get_plugin_detail("TestPlugin", "dev1").unwrap().unwrap();
+        assert_eq!(detail2.manuals.len(), 1);
+        assert_eq!(detail2.manuals[0].source, "url");
+
+        db.delete_plugin_manual(mid).unwrap();
+        let detail3 = db.get_plugin_detail("TestPlugin", "dev1").unwrap().unwrap();
+        assert!(detail3.manuals.is_empty());
     }
 }

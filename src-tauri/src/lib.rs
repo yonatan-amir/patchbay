@@ -19,16 +19,44 @@ struct ScanResult {
     errors: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct FormatInstance {
+    format: String,
+    path: String,
+    version: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ManualEntry {
+    id: i64,
+    source: String,
+    path_or_url: String,
+}
+
+#[derive(Serialize)]
+struct PluginDetailEntry {
+    id: i64,
+    name: String,
+    vendor: Option<String>,
+    category: Option<String>,
+    instances: Vec<FormatInstance>,
+    note: String,
+    manuals: Vec<ManualEntry>,
+}
+
+fn device_id() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "local".to_string())
+}
+
 /// Scan all plugin formats (VST3, VST2, CLAP, AU) against default system paths
 /// and persist results to SQLite. Bundles unchanged since the last scan are skipped.
 #[tauri::command]
 fn scan_plugins(state: tauri::State<'_, Mutex<Database>>) -> Result<ScanResult, String> {
-    let device_id = std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "local".to_string());
-
+    let did = device_id();
     let db = state.lock().map_err(|e| e.to_string())?;
-    let known_mtimes = db.get_known_mtimes(&device_id).map_err(|e| e.to_string())?;
+    let known_mtimes = db.get_known_mtimes(&did).map_err(|e| e.to_string())?;
 
     let vst2_probe = scanner::find_vst2_probe();
     let clap_probe = scanner::find_clap_probe();
@@ -58,7 +86,7 @@ fn scan_plugins(state: tauri::State<'_, Mutex<Database>>) -> Result<ScanResult, 
     total_skipped += skipped;
     all_errors.extend(errors.iter().map(|e| e.to_string()));
 
-    let plugins_found = indexer::index_plugins(&db, all_plugins, &device_id)
+    let plugins_found = indexer::index_plugins(&db, all_plugins, &did)
         .map_err(|e| e.to_string())?;
 
     Ok(ScanResult {
@@ -71,18 +99,61 @@ fn scan_plugins(state: tauri::State<'_, Mutex<Database>>) -> Result<ScanResult, 
 /// Return all indexed plugins for the current device.
 #[tauri::command]
 fn list_plugins(state: tauri::State<'_, Mutex<Database>>) -> Result<Vec<PluginEntry>, String> {
-    let device_id = std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "local".to_string());
-
+    let did = device_id();
     let db = state.lock().map_err(|e| e.to_string())?;
-    let rows = db.list_plugins(&device_id).map_err(|e| e.to_string())?;
+    let rows = db.list_plugins(&did).map_err(|e| e.to_string())?;
     Ok(rows.into_iter().map(|r| PluginEntry {
         name: r.name,
         vendor: r.vendor,
         format: r.format,
         category: r.category,
     }).collect())
+}
+
+/// Return full detail for a plugin by name: all format instances, user note, and manuals.
+#[tauri::command]
+fn get_plugin_detail(name: String, state: tauri::State<'_, Mutex<Database>>) -> Result<Option<PluginDetailEntry>, String> {
+    let did = device_id();
+    let db = state.lock().map_err(|e| e.to_string())?;
+    let detail = db.get_plugin_detail(&name, &did).map_err(|e| e.to_string())?;
+    Ok(detail.map(|d| PluginDetailEntry {
+        id: d.id,
+        name: d.name,
+        vendor: d.vendor,
+        category: d.category,
+        instances: d.instances.into_iter().map(|i| FormatInstance {
+            format: i.format,
+            path: i.path,
+            version: i.version,
+        }).collect(),
+        note: d.note,
+        manuals: d.manuals.into_iter().map(|m| ManualEntry {
+            id: m.id,
+            source: m.source,
+            path_or_url: m.path_or_url,
+        }).collect(),
+    }))
+}
+
+/// Save or replace the user note for a plugin (identified by its primary row id).
+#[tauri::command]
+fn save_plugin_note(plugin_id: i64, body: String, state: tauri::State<'_, Mutex<Database>>) -> Result<(), String> {
+    let db = state.lock().map_err(|e| e.to_string())?;
+    db.upsert_plugin_note(plugin_id, &body).map_err(|e| e.to_string())
+}
+
+/// Attach a manual URL or local path to a plugin.
+#[tauri::command]
+fn save_plugin_manual(plugin_id: i64, source: String, path_or_url: String, state: tauri::State<'_, Mutex<Database>>) -> Result<i64, String> {
+    let db = state.lock().map_err(|e| e.to_string())?;
+    db.save_plugin_manual(plugin_id, &source, &path_or_url).map_err(|e| e.to_string())
+}
+
+/// Remove a manual entry by id.
+#[tauri::command]
+fn delete_plugin_manual(manual_id: i64, state: tauri::State<'_, Mutex<Database>>) -> Result<(), String> {
+    let db = state.lock().map_err(|e| e.to_string())?;
+    db.delete_plugin_manual(manual_id).map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -95,7 +166,14 @@ pub fn run() {
             app.manage(Mutex::new(db));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![scan_plugins, list_plugins])
+        .invoke_handler(tauri::generate_handler![
+            scan_plugins,
+            list_plugins,
+            get_plugin_detail,
+            save_plugin_note,
+            save_plugin_manual,
+            delete_plugin_manual,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
