@@ -79,7 +79,10 @@ struct ClassInfo {
     vendor: Option<String>,
     #[serde(rename = "Version")]
     version: Option<String>,
-    // Sub Categories carries the useful taxonomy ("Fx|EQ"); Category is always "Audio Module Class"
+    // "Audio Module Class" = real plugin; "Component Controller Class" = paired UI controller (skip).
+    #[serde(rename = "Category")]
+    class_category: Option<String>,
+    // Sub Categories carries the useful taxonomy ("Fx|EQ")
     #[serde(rename = "Sub Categories")]
     sub_categories: Option<Vec<String>>,
 }
@@ -255,7 +258,7 @@ fn collect_bundles(
                 }
             }
             match parse_vst3_bundle(&path, current_mtime) {
-                Ok(p) => plugins.push(p),
+                Ok(ps) => plugins.extend(ps),
                 Err(e) => errors.push(e),
             }
         } else if path.is_dir() {
@@ -265,12 +268,12 @@ fn collect_bundles(
     }
 }
 
-fn parse_vst3_bundle(bundle: &Path, file_mtime: Option<i64>) -> Result<ScannedPlugin, ScanError> {
+fn parse_vst3_bundle(bundle: &Path, file_mtime: Option<i64>) -> Result<Vec<ScannedPlugin>, ScanError> {
     let moduleinfo_path = bundle.join("Contents").join("moduleinfo.json");
 
     if moduleinfo_path.exists() {
-        if let Ok(p) = parse_from_moduleinfo(bundle, &moduleinfo_path, file_mtime) {
-            return Ok(p);
+        if let Ok(ps) = parse_from_moduleinfo(bundle, &moduleinfo_path, file_mtime) {
+            return Ok(ps);
         }
         // malformed/empty moduleinfo.json — fall through to plist/filename
     }
@@ -284,7 +287,7 @@ fn parse_vst3_bundle(bundle: &Path, file_mtime: Option<i64>) -> Result<ScannedPl
         (None, None, None)
     };
 
-    Ok(ScannedPlugin {
+    Ok(vec![ScannedPlugin {
         name: plist_name.unwrap_or_else(|| file_stem(bundle)),
         vendor,
         version,
@@ -293,54 +296,80 @@ fn parse_vst3_bundle(bundle: &Path, file_mtime: Option<i64>) -> Result<ScannedPl
         path: bundle.to_path_buf(),
         format: PluginFormat::Vst3,
         file_mtime,
-    })
+    }])
 }
 
 fn parse_from_moduleinfo(
     bundle: &Path,
     path: &Path,
     file_mtime: Option<i64>,
-) -> Result<ScannedPlugin, ScanError> {
+) -> Result<Vec<ScannedPlugin>, ScanError> {
     let data = std::fs::read_to_string(path)
         .map_err(|e| ScanError::Io { path: path.to_path_buf(), source: e })?;
 
     let info: ModuleInfo = serde_json::from_str(&data)
         .map_err(|e| ScanError::Json { path: path.to_path_buf(), source: e })?;
 
-    let first_class = info.classes.as_deref().and_then(|c| c.first());
+    let factory_vendor = info.factory_info.as_ref().and_then(|f| f.vendor.clone());
+    let bundle_name = info.name.clone();
+    let bundle_version = info.version.clone();
 
-    let name = first_class
-        .and_then(|c| c.name.clone())
-        .or_else(|| info.name.clone())
-        .unwrap_or_else(|| file_stem(bundle));
+    // Filter to audio plugin classes only — skip "Component Controller Class" (paired UI)
+    // and any other non-audio class types. Entries with no Category field are included
+    // for compatibility with older/hand-crafted moduleinfo.json files.
+    let audio_classes: Vec<&ClassInfo> = info.classes
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter(|c| {
+            c.class_category
+                .as_deref()
+                .map_or(true, |cat| cat == "Audio Module Class")
+        })
+        .collect();
 
-    let vendor = first_class
-        .and_then(|c| c.vendor.clone())
-        .or_else(|| info.factory_info.as_ref().and_then(|f| f.vendor.clone()));
+    if audio_classes.is_empty() {
+        // moduleinfo.json exists but has no audio classes — single fallback record
+        return Ok(vec![ScannedPlugin {
+            name: bundle_name.unwrap_or_else(|| file_stem(bundle)),
+            vendor: factory_vendor,
+            version: bundle_version,
+            category: None,
+            class_id: None,
+            path: bundle.to_path_buf(),
+            format: PluginFormat::Vst3,
+            file_mtime,
+        }]);
+    }
 
-    let version = first_class
-        .and_then(|c| c.version.clone())
-        .or_else(|| info.version.clone());
+    let plugins = audio_classes
+        .iter()
+        .map(|class| {
+            let name = class.name.clone()
+                .or_else(|| bundle_name.clone())
+                .unwrap_or_else(|| file_stem(bundle));
+            let vendor = class.vendor.clone().or_else(|| factory_vendor.clone());
+            let version = class.version.clone().or_else(|| bundle_version.clone());
+            let category = class.sub_categories
+                .as_ref()
+                .filter(|sc| !sc.is_empty())
+                .map(|sc| sc.join("|"));
+            let class_id = class.cid.clone();
 
-    let category = first_class.and_then(|c| {
-        c.sub_categories
-            .as_ref()
-            .filter(|sc| !sc.is_empty())
-            .map(|sc| sc.join("|"))
-    });
+            ScannedPlugin {
+                name,
+                vendor,
+                version,
+                category,
+                class_id,
+                path: bundle.to_path_buf(),
+                format: PluginFormat::Vst3,
+                file_mtime,
+            }
+        })
+        .collect();
 
-    let class_id = first_class.and_then(|c| c.cid.clone());
-
-    Ok(ScannedPlugin {
-        name,
-        vendor,
-        version,
-        category,
-        class_id,
-        path: bundle.to_path_buf(),
-        format: PluginFormat::Vst3,
-        file_mtime,
-    })
+    Ok(plugins)
 }
 
 // --- AU Public API ---
@@ -496,6 +525,7 @@ mod tests {
             "Factory Info": { "Vendor": "Acme Audio" },
             "Classes": [{
                 "CID": "AABBCCDD11223344AABBCCDD11223344",
+                "Category": "Audio Module Class",
                 "Name": "Test Plugin",
                 "Vendor": "Acme Audio",
                 "Version": "2.1.0",
@@ -513,6 +543,63 @@ mod tests {
         assert_eq!(p.version.as_deref(), Some("2.1.0"));
         assert_eq!(p.category.as_deref(), Some("Fx|EQ"));
         assert_eq!(p.class_id.as_deref(), Some("AABBCCDD11223344AABBCCDD11223344"));
+    }
+
+    #[test]
+    fn expands_multiple_audio_classes_per_bundle() {
+        let tmp = TempDir::new().unwrap();
+        make_bundle(tmp.path(), "MultiBundle", Some(r#"{
+            "Name": "Multi Bundle",
+            "Factory Info": { "Vendor": "Acme Audio" },
+            "Classes": [
+                {
+                    "CID": "AAA",
+                    "Category": "Audio Module Class",
+                    "Name": "Synth Mono",
+                    "Sub Categories": ["Instrument", "Synth"]
+                },
+                {
+                    "CID": "BBB",
+                    "Category": "Audio Module Class",
+                    "Name": "Synth Poly",
+                    "Sub Categories": ["Instrument", "Synth"]
+                },
+                {
+                    "CID": "CCC",
+                    "Category": "Component Controller Class",
+                    "Name": "Synth Controller"
+                }
+            ]
+        }"#), None);
+
+        let (plugins, _, errors) = scan_vst3(&[tmp.path().to_path_buf()], &HashMap::new());
+        assert!(errors.is_empty());
+        // 2 Audio Module Classes, 1 Component Controller Class (filtered out)
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0].name, "Synth Mono");
+        assert_eq!(plugins[0].vendor.as_deref(), Some("Acme Audio"));
+        assert_eq!(plugins[0].class_id.as_deref(), Some("AAA"));
+        assert_eq!(plugins[1].name, "Synth Poly");
+        assert_eq!(plugins[1].class_id.as_deref(), Some("BBB"));
+    }
+
+    #[test]
+    fn falls_back_when_all_classes_are_controllers() {
+        let tmp = TempDir::new().unwrap();
+        make_bundle(tmp.path(), "ControllerOnly", Some(r#"{
+            "Name": "Some Plugin",
+            "Factory Info": { "Vendor": "Acme" },
+            "Classes": [{
+                "CID": "CCC",
+                "Category": "Component Controller Class",
+                "Name": "Controller"
+            }]
+        }"#), None);
+
+        let (plugins, _, errors) = scan_vst3(&[tmp.path().to_path_buf()], &HashMap::new());
+        assert!(errors.is_empty());
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "Some Plugin");
     }
 
     #[test]
