@@ -345,12 +345,14 @@ fn parse_from_moduleinfo(
 
 // --- AU Public API ---
 
-/// Enumerate all AudioUnits registered with the CoreAudio component registry.
-/// AU registry queries are fast; all AUs are always re-scanned (no mtime skip).
+/// Walk the standard AU component directories and scan all `.component` bundles.
+/// Reads `Info.plist` directly — one record per `AudioComponents` plist entry —
+/// so multi-component bundles (e.g. stereo + mono variants) are fully expanded.
+/// AU directory walks are fast; all AUs are always re-scanned (no mtime skip).
 /// On non-macOS platforms returns empty.
 #[cfg(target_os = "macos")]
 pub fn scan_au() -> (Vec<ScannedPlugin>, usize, Vec<ScanError>) {
-    let (plugins, errors) = au::scan_au_registry();
+    let (plugins, errors) = au::scan_au_filesystem(&au::default_au_dirs());
     (plugins, 0, errors)
 }
 

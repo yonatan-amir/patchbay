@@ -99,7 +99,130 @@ fn split_au_name(full_name: &str) -> (String, Option<String>) {
     }
 }
 
-// ── Path index ────────────────────────────────────────────────────────────────
+// ── Filesystem walk ───────────────────────────────────────────────────────────
+
+struct ComponentInfo {
+    type_str: String,
+    subtype_str: String,
+    mfr_str: String,
+    plist_name: Option<String>,
+}
+
+/// Parse **all** `AudioComponents` array entries from a `.component` bundle's `Info.plist`.
+/// A single bundle can declare multiple components (e.g. stereo + mono variants of an instrument).
+fn read_audio_components(bundle: &Path) -> Vec<ComponentInfo> {
+    let plist_path = bundle.join("Contents").join("Info.plist");
+    let Ok(val) = plist::Value::from_file(&plist_path) else { return vec![] };
+    let Some(dict) = val.as_dictionary() else { return vec![] };
+    let Some(array) = dict.get("AudioComponents").and_then(|v| v.as_array()) else {
+        return vec![];
+    };
+    array
+        .iter()
+        .filter_map(|v| v.as_dictionary())
+        .filter_map(|comp| {
+            let t = plist_ostype(comp, "type")?;
+            let s = plist_ostype(comp, "subtype")?;
+            let m = plist_ostype(comp, "manufacturer")?;
+            let plist_name = comp.get("name").and_then(|v| v.as_string()).map(str::to_string);
+            Some(ComponentInfo { type_str: t, subtype_str: s, mfr_str: m, plist_name })
+        })
+        .collect()
+}
+
+fn read_bundle_version(bundle: &Path) -> Option<String> {
+    let plist_path = bundle.join("Contents").join("Info.plist");
+    let Ok(val) = plist::Value::from_file(&plist_path) else { return None };
+    let dict = val.as_dictionary()?;
+    dict.get("CFBundleShortVersionString")
+        .and_then(|v| v.as_string())
+        .map(str::to_string)
+}
+
+/// Walk `dirs` for `.component` bundle directories. Never executes plugin code.
+pub fn walk_component_bundles(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in dirs {
+        collect_components(dir, &mut out);
+    }
+    out
+}
+
+fn collect_components(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e.eq_ignore_ascii_case("component")).unwrap_or(false)
+            && path.is_dir()
+        {
+            out.push(path);
+        } else if path.is_dir() {
+            collect_components(&path, out);
+        }
+    }
+}
+
+pub fn default_au_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![
+        PathBuf::from("/System/Library/Components"),
+        PathBuf::from("/Library/Audio/Plug-Ins/Components"),
+        PathBuf::from("/Library/Components"),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(PathBuf::from(&home).join("Library/Audio/Plug-Ins/Components"));
+        dirs.push(PathBuf::from(&home).join("Library/Components"));
+    }
+    dirs
+}
+
+/// Scan AU plugins by walking the filesystem and reading `Info.plist` directly.
+///
+/// Emits one `ScannedPlugin` per `AudioComponents` plist entry, so a single bundle
+/// that declares multiple components (e.g. stereo + mono + multi-output variants)
+/// produces multiple records — the same way Ableton counts them.
+///
+/// Unlike the registry approach, this finds AUs regardless of whether CoreAudio
+/// has registered them, which is important for Intel-only or damaged plugins.
+///
+/// Returns `(plugins, errors)`.
+pub fn scan_au_filesystem(dirs: &[PathBuf]) -> (Vec<ScannedPlugin>, Vec<ScanError>) {
+    let mut plugins = Vec::new();
+
+    for bundle in walk_component_bundles(dirs) {
+        let file_mtime = super::bundle_mtime(&bundle);
+        let version = read_bundle_version(&bundle);
+        let components = read_audio_components(&bundle);
+
+        if components.is_empty() {
+            continue;
+        }
+
+        for comp in components {
+            let class_id = format!("{}/{}/{}", comp.type_str, comp.subtype_str, comp.mfr_str);
+            let category = au_type_to_category(&comp.type_str).map(str::to_string);
+
+            let (name, vendor) = match comp.plist_name.as_deref() {
+                Some(s) if !s.is_empty() => split_au_name(s),
+                _ => (super::file_stem(&bundle), None),
+            };
+
+            plugins.push(ScannedPlugin {
+                name,
+                vendor,
+                version: version.clone(),
+                category,
+                class_id: Some(class_id),
+                path: bundle.clone(),
+                format: PluginFormat::Au,
+                file_mtime,
+            });
+        }
+    }
+
+    (plugins, Vec::new())
+}
+
+// ── Path index (used by registry scanner) ────────────────────────────────────
 
 /// Walk the standard AU search directories and build a `class_id → bundle path` map.
 /// Used to correlate registry entries (which carry no path) with filesystem bundles.
@@ -343,6 +466,134 @@ mod tests {
         assert!(extract_class_id(&bundle).is_none());
     }
 
+    // ── filesystem-walk tests ─────────────────────────────────────────────────
+
+    const MULTI_COMPONENT_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleShortVersionString</key><string>7.4.3</string>
+    <key>AudioComponents</key><array>
+        <dict>
+            <key>name</key><string>NI: Kontakt</string>
+            <key>type</key><string>aumu</string>
+            <key>subtype</key><string>nikt</string>
+            <key>manufacturer</key><string>NInm</string>
+        </dict>
+        <dict>
+            <key>name</key><string>NI: Kontakt (Mono)</string>
+            <key>type</key><string>aumu</string>
+            <key>subtype</key><string>nkmo</string>
+            <key>manufacturer</key><string>NInm</string>
+        </dict>
+    </array>
+</dict></plist>"#;
+
+    #[test]
+    fn read_audio_components_parses_all_entries() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = make_component(tmp.path(), "Kontakt", MULTI_COMPONENT_PLIST);
+        let comps = read_audio_components(&bundle);
+        assert_eq!(comps.len(), 2);
+        assert_eq!(comps[0].plist_name.as_deref(), Some("NI: Kontakt"));
+        assert_eq!(comps[0].type_str, "aumu");
+        assert_eq!(comps[1].plist_name.as_deref(), Some("NI: Kontakt (Mono)"));
+    }
+
+    #[test]
+    fn read_audio_components_returns_empty_when_no_plist() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("Broken.component");
+        fs::create_dir_all(bundle.join("Contents")).unwrap();
+        assert!(read_audio_components(&bundle).is_empty());
+    }
+
+    #[test]
+    fn read_audio_components_returns_empty_when_no_audio_components_key() {
+        let tmp = TempDir::new().unwrap();
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleName</key><string>NoAudioComponentsBundle</string>
+</dict></plist>"#;
+        let bundle = make_component(tmp.path(), "NoAC", plist);
+        assert!(read_audio_components(&bundle).is_empty());
+    }
+
+    #[test]
+    fn read_bundle_version_reads_cfbundle_short_version() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = make_component(tmp.path(), "Kontakt", MULTI_COMPONENT_PLIST);
+        assert_eq!(read_bundle_version(&bundle).as_deref(), Some("7.4.3"));
+    }
+
+    #[test]
+    fn walk_component_bundles_finds_nested() {
+        let tmp = TempDir::new().unwrap();
+        // Flat
+        make_component(tmp.path(), "Pro-Q 3", PRO_Q_AU_PLIST);
+        // Nested inside a vendor subdirectory
+        let vendor = tmp.path().join("Native Instruments");
+        fs::create_dir_all(&vendor).unwrap();
+        make_component(&vendor, "Kontakt", MULTI_COMPONENT_PLIST);
+
+        let found = walk_component_bundles(&[tmp.path().to_path_buf()]);
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn scan_au_filesystem_expands_multi_component_bundle() {
+        let tmp = TempDir::new().unwrap();
+        make_component(tmp.path(), "Kontakt", MULTI_COMPONENT_PLIST);
+
+        let (plugins, errors) = scan_au_filesystem(&[tmp.path().to_path_buf()]);
+        assert!(errors.is_empty());
+        // Two AudioComponents entries → two plugins
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0].name, "Kontakt");
+        assert_eq!(plugins[0].vendor.as_deref(), Some("NI"));
+        assert_eq!(plugins[0].version.as_deref(), Some("7.4.3"));
+        assert_eq!(plugins[0].category.as_deref(), Some("Instrument"));
+        assert!(plugins[0].class_id.as_deref().is_some());
+        assert_eq!(plugins[1].name, "Kontakt (Mono)");
+    }
+
+    #[test]
+    fn scan_au_filesystem_skips_bundles_without_audio_components() {
+        let tmp = TempDir::new().unwrap();
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleName</key><string>NotAnAU</string>
+</dict></plist>"#;
+        make_component(tmp.path(), "NotAnAU", plist);
+
+        let (plugins, errors) = scan_au_filesystem(&[tmp.path().to_path_buf()]);
+        assert!(errors.is_empty());
+        assert!(plugins.is_empty());
+    }
+
+    #[test]
+    fn scan_au_filesystem_falls_back_to_filename_when_no_plist_name() {
+        let tmp = TempDir::new().unwrap();
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>AudioComponents</key><array><dict>
+        <key>type</key><string>aufx</string>
+        <key>subtype</key><string>test</string>
+        <key>manufacturer</key><string>demo</string>
+    </dict></array>
+</dict></plist>"#;
+        make_component(tmp.path(), "MyPlugin", plist);
+
+        let (plugins, _) = scan_au_filesystem(&[tmp.path().to_path_buf()]);
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "MyPlugin");
+        assert!(plugins[0].vendor.is_none());
+    }
+
+    // ── registry integration test ─────────────────────────────────────────────
+
     #[test]
     #[ignore = "requires macOS with installed AUs — run manually: cargo test -- --ignored"]
     fn registry_returns_results_with_paths() {
@@ -355,8 +606,6 @@ mod tests {
         );
         let with_path = plugins.iter().filter(|p| p.path != PathBuf::new()).count();
         let pct = with_path * 100 / plugins.len();
-        // Some registered AUs on modern macOS are dynamically registered without a
-        // traditional .component on disk, so 100% coverage isn't achievable.
         assert!(
             with_path > 0,
             "expected at least one AU to have a resolved path, got 0/{} — \
@@ -364,5 +613,23 @@ mod tests {
             plugins.len()
         );
         eprintln!("AU path coverage: {pct}% ({with_path}/{}) resolved", plugins.len());
+    }
+
+    #[test]
+    #[ignore = "requires macOS with installed AUs — run manually: cargo test -- --ignored"]
+    fn filesystem_scan_finds_more_than_registry() {
+        let (fs_plugins, _) = scan_au_filesystem(&default_au_dirs());
+        let (reg_plugins, _) = scan_au_registry();
+        eprintln!(
+            "filesystem: {}  registry: {}",
+            fs_plugins.len(),
+            reg_plugins.len()
+        );
+        assert!(
+            fs_plugins.len() >= reg_plugins.len(),
+            "filesystem scan ({}) should find at least as many AUs as registry ({})",
+            fs_plugins.len(),
+            reg_plugins.len()
+        );
     }
 }

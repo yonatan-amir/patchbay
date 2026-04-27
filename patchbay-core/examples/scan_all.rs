@@ -23,7 +23,7 @@ fn main() {
 
     println!("\n=== AU ===");
     let (plugins, _, errors) = scanner::scan_au();
-    let with_path = plugins.iter().filter(|p| p.path != std::path::PathBuf::new()).count();
-    println!("  found: {}  (bundle path resolved: {})", plugins.len(), with_path);
+    let bundles: std::collections::HashSet<_> = plugins.iter().map(|p| &p.path).collect();
+    println!("  found: {}  (from {} bundles)", plugins.len(), bundles.len());
     for e in &errors { eprintln!("  err: {e}"); }
 }
