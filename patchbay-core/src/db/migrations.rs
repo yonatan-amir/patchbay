@@ -205,4 +205,20 @@ Migration {
 Migration {
     version: 4,
     sql: "ALTER TABLE plugins ADD COLUMN file_mtime INTEGER;",
+},
+Migration {
+    version: 5,
+    sql: "
+        -- Backfill class_id for rows that don't have one so the new
+        -- composite unique index can use it. Synthetic value = path + ':'
+        -- which is stable across re-scans for the same bundle.
+        UPDATE plugins SET class_id = path || ':' WHERE class_id IS NULL;
+
+        -- Drop the old per-path unique index.
+        DROP INDEX IF EXISTS idx_plugins_path_unique;
+
+        -- New composite key: one row per (bundle path, plugin class).
+        -- Allows AU / VST3 multi-component bundles to expand fully.
+        CREATE UNIQUE INDEX idx_plugins_path_class ON plugins(path, class_id);
+    ",
 }];

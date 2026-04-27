@@ -61,11 +61,10 @@ impl Database {
             "INSERT INTO plugins
                  (sync_id, name, vendor, format, path, version, class_id, category, device_id, file_mtime)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(path) DO UPDATE SET
+             ON CONFLICT(path, class_id) DO UPDATE SET
                  name       = excluded.name,
                  vendor     = excluded.vendor,
                  version    = excluded.version,
-                 class_id   = excluded.class_id,
                  category   = excluded.category,
                  file_mtime = excluded.file_mtime,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
