@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{PluginFormat, ScanError, ScannedPlugin};
 
@@ -98,6 +99,57 @@ fn split_au_name(full_name: &str) -> (String, Option<String>) {
     }
 }
 
+// ── Path index ────────────────────────────────────────────────────────────────
+
+/// Walk the standard AU search directories and build a `class_id → bundle path` map.
+/// Used to correlate registry entries (which carry no path) with filesystem bundles.
+fn build_path_index() -> HashMap<String, PathBuf> {
+    let mut map = HashMap::new();
+    let mut dirs = vec![PathBuf::from("/Library/Audio/Plug-Ins/Components")];
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(PathBuf::from(home).join("Library/Audio/Plug-Ins/Components"));
+    }
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e.eq_ignore_ascii_case("component")).unwrap_or(false) {
+                if let Some(id) = extract_class_id(&path) {
+                    map.insert(id, path);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Parse a `.component` bundle's `Info.plist` and return its `"type/subtype/mfr"` class ID.
+fn extract_class_id(bundle: &Path) -> Option<String> {
+    let plist_path = bundle.join("Contents").join("Info.plist");
+    let val = plist::Value::from_file(&plist_path).ok()?;
+    let dict = val.as_dictionary()?;
+    let comp = dict
+        .get("AudioComponents")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_dictionary())?;
+
+    let t = plist_ostype(comp, "type")?;
+    let s = plist_ostype(comp, "subtype")?;
+    let m = plist_ostype(comp, "manufacturer")?;
+    Some(format!("{t}/{s}/{m}"))
+}
+
+/// Read an OSType field from a plist dictionary entry, normalizing to the same
+/// 4-char string encoding as `ostype_to_str` so keys match registry-derived class IDs.
+fn plist_ostype(dict: &plist::Dictionary, key: &str) -> Option<String> {
+    match dict.get(key)? {
+        plist::Value::String(s) => Some(s.clone()),
+        plist::Value::Integer(i) => Some(ostype_to_str(i.as_unsigned()? as u32)),
+        _ => None,
+    }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Enumerate all AudioUnits registered with the CoreAudio component registry.
@@ -111,6 +163,7 @@ fn split_au_name(full_name: &str) -> (String, Option<String>) {
 /// with the VST3 scanner.
 pub fn scan_au_registry() -> (Vec<ScannedPlugin>, Vec<ScanError>) {
     let mut plugins = Vec::new();
+    let path_index = build_path_index();
 
     // All-zero descriptor is the wildcard: match every registered component.
     let wildcard = AudioComponentDescription {
@@ -162,13 +215,14 @@ pub fn scan_au_registry() -> (Vec<ScannedPlugin>, Vec<ScanError>) {
             }
         };
 
+        let path = path_index.get(&class_id).cloned().unwrap_or_default();
         plugins.push(ScannedPlugin {
             name,
             vendor,
             version: None,
             category,
             class_id: Some(class_id),
-            path: PathBuf::new(),
+            path,
             format: PluginFormat::Au,
         });
     }
@@ -181,6 +235,8 @@ pub fn scan_au_registry() -> (Vec<ScannedPlugin>, Vec<ScanError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn ostype_printable_roundtrips() {
@@ -219,14 +275,75 @@ mod tests {
         assert_eq!(au_type_to_category("xxxx"), None);
     }
 
+    const PRO_Q_AU_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>AudioComponents</key><array><dict>
+        <key>name</key><string>FabFilter: Pro-Q 3</string>
+        <key>type</key><string>aufx</string>
+        <key>subtype</key><string>FPQ3</string>
+        <key>manufacturer</key><string>FabF</string>
+        <key>version</key><integer>196608</integer>
+    </dict></array>
+</dict></plist>"#;
+
+    // Same plugin but with OSType fields stored as integers (0x61756678 = "aufx").
+    const PRO_Q_AU_PLIST_INT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>AudioComponents</key><array><dict>
+        <key>name</key><string>FabFilter: Pro-Q 3</string>
+        <key>type</key><integer>1633903736</integer>
+        <key>subtype</key><integer>1180267315</integer>
+        <key>manufacturer</key><integer>1179402310</integer>
+    </dict></array>
+</dict></plist>"#;
+
+    fn make_component(dir: &std::path::Path, name: &str, plist: &str) -> PathBuf {
+        let bundle = dir.join(format!("{name}.component"));
+        fs::create_dir_all(bundle.join("Contents")).unwrap();
+        fs::write(bundle.join("Contents").join("Info.plist"), plist).unwrap();
+        bundle
+    }
+
+    #[test]
+    fn extract_class_id_from_string_ostype() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = make_component(tmp.path(), "Pro-Q 3", PRO_Q_AU_PLIST);
+        assert_eq!(extract_class_id(&bundle).as_deref(), Some("aufx/FPQ3/FabF"));
+    }
+
+    #[test]
+    fn extract_class_id_from_integer_ostype() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = make_component(tmp.path(), "Pro-Q 3 (int)", PRO_Q_AU_PLIST_INT);
+        // Integer OSTypes must decode to the same 4-char string as the registry.
+        assert_eq!(extract_class_id(&bundle).as_deref(), Some("aufx/FPQ3/FabF"));
+    }
+
+    #[test]
+    fn extract_class_id_returns_none_for_missing_plist() {
+        let tmp = TempDir::new().unwrap();
+        let bundle = tmp.path().join("Empty.component");
+        fs::create_dir_all(bundle.join("Contents")).unwrap();
+        assert!(extract_class_id(&bundle).is_none());
+    }
+
     #[test]
     #[ignore = "requires macOS with installed AUs — run manually: cargo test -- --ignored"]
-    fn registry_returns_expected_count() {
+    fn registry_returns_results_with_paths() {
         let (plugins, errors) = scan_au_registry();
         assert!(errors.is_empty());
         assert!(
             plugins.len() > 100,
             "expected >100 registered AUs, got {}",
+            plugins.len()
+        );
+        let with_path = plugins.iter().filter(|p| p.path != PathBuf::new()).count();
+        let pct = with_path * 100 / plugins.len();
+        assert!(
+            pct >= 80,
+            "expected ≥80% of AUs to have a resolved path, got {pct}% ({with_path}/{})",
             plugins.len()
         );
     }
