@@ -11,8 +11,8 @@ struct ScanResult {
     errors: Vec<String>,
 }
 
-/// Run the VST3 scanner against the default system paths and persist results to SQLite.
-/// On subsequent runs, bundles whose mtime is unchanged since the last scan are skipped.
+/// Scan all plugin formats (VST3, VST2, CLAP, AU) against default system paths
+/// and persist results to SQLite. Bundles unchanged since the last scan are skipped.
 #[tauri::command]
 fn scan_plugins(state: tauri::State<'_, Mutex<Database>>) -> Result<ScanResult, String> {
     let device_id = std::env::var("COMPUTERNAME")
@@ -20,19 +20,43 @@ fn scan_plugins(state: tauri::State<'_, Mutex<Database>>) -> Result<ScanResult, 
         .unwrap_or_else(|_| "local".to_string());
 
     let db = state.lock().map_err(|e| e.to_string())?;
-
     let known_mtimes = db.get_known_mtimes(&device_id).map_err(|e| e.to_string())?;
 
-    let paths = scanner::default_vst3_paths();
-    let (plugins, skipped, errors) = scanner::scan_vst3(&paths, &known_mtimes);
+    let vst2_probe = scanner::find_vst2_probe();
+    let clap_probe = scanner::find_clap_probe();
 
-    let plugins_found = indexer::index_plugins(&db, plugins, &device_id)
+    let mut all_plugins = Vec::new();
+    let mut total_skipped = 0usize;
+    let mut all_errors: Vec<String> = Vec::new();
+
+    let (plugins, skipped, errors) = scanner::scan_vst3(&scanner::default_vst3_paths(), &known_mtimes);
+    all_plugins.extend(plugins);
+    total_skipped += skipped;
+    all_errors.extend(errors.iter().map(|e| e.to_string()));
+
+    let (plugins, skipped, errors) = scanner::scan_vst2(&scanner::default_vst2_paths(), vst2_probe.as_deref(), &known_mtimes);
+    all_plugins.extend(plugins);
+    total_skipped += skipped;
+    all_errors.extend(errors.iter().map(|e| e.to_string()));
+
+    let (plugins, skipped, errors) = scanner::scan_clap(&scanner::default_clap_paths(), clap_probe.as_deref(), &known_mtimes);
+    all_plugins.extend(plugins);
+    total_skipped += skipped;
+    all_errors.extend(errors.iter().map(|e| e.to_string()));
+
+    // scan_au returns empty on non-macOS; no cfg guard needed here
+    let (plugins, skipped, errors) = scanner::scan_au();
+    all_plugins.extend(plugins);
+    total_skipped += skipped;
+    all_errors.extend(errors.iter().map(|e| e.to_string()));
+
+    let plugins_found = indexer::index_plugins(&db, all_plugins, &device_id)
         .map_err(|e| e.to_string())?;
 
     Ok(ScanResult {
         plugins_found,
-        plugins_skipped: skipped,
-        errors: errors.iter().map(|e| e.to_string()).collect(),
+        plugins_skipped: total_skipped,
+        errors: all_errors,
     })
 }
 

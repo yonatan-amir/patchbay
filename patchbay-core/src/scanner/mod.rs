@@ -176,6 +176,11 @@ pub fn walk_clap_bundles(paths: &[PathBuf]) -> Vec<PathBuf> {
     clap::walk_clap_bundles(paths)
 }
 
+/// Locate the `patchbay-clap-probe` binary next to the current executable.
+pub fn find_clap_probe() -> Option<PathBuf> {
+    clap::find_probe()
+}
+
 /// Walk `paths` for VST2 plugins, probing each binary for metadata when a probe binary is available.
 ///
 /// Returns `(plugins, skipped, errors)` where `skipped` is the number of bundles whose
@@ -192,6 +197,11 @@ pub fn scan_vst2(
 /// without loading any plugin code. Useful for fast inventory.
 pub fn walk_vst2_bundles(paths: &[PathBuf]) -> Vec<PathBuf> {
     vst2::walk_vst_bundles(paths)
+}
+
+/// Locate the `patchbay-vst2-probe` binary next to the current executable.
+pub fn find_vst2_probe() -> Option<PathBuf> {
+    vst2::find_probe()
 }
 
 /// Walk `paths`, find every `.vst3` bundle, parse metadata.
