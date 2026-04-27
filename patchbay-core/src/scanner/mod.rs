@@ -269,7 +269,12 @@ fn collect_bundles(
 }
 
 fn parse_vst3_bundle(bundle: &Path, file_mtime: Option<i64>) -> Result<Vec<ScannedPlugin>, ScanError> {
-    let moduleinfo_path = bundle.join("Contents").join("moduleinfo.json");
+    // VST3 SDK spec: moduleinfo.json lives in Contents/Resources/.
+    // Some older plugins put it directly in Contents/ — check both.
+    let moduleinfo_path = {
+        let resources = bundle.join("Contents").join("Resources").join("moduleinfo.json");
+        if resources.exists() { resources } else { bundle.join("Contents").join("moduleinfo.json") }
+    };
 
     if moduleinfo_path.exists() {
         if let Ok(ps) = parse_from_moduleinfo(bundle, &moduleinfo_path, file_mtime) {
