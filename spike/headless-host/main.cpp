@@ -32,7 +32,7 @@ static juce::String makeTone() {
     juce::File f(path);
     f.deleteFile();
     juce::WavAudioFormat wav;
-    auto stream = f.createOutputStream();
+    std::unique_ptr<juce::OutputStream> stream = f.createOutputStream();
     auto writer = wav.createWriterFor(
         stream,
         juce::AudioFormatWriterOptions{}.withSampleRate(kSR).withNumChannels(kCh).withBitsPerSample(24));
@@ -202,7 +202,7 @@ public:
         juce::File outFile(outPath);
         outFile.deleteFile();
         juce::WavAudioFormat wav;
-        auto stream = outFile.createOutputStream();
+        std::unique_ptr<juce::OutputStream> stream = outFile.createOutputStream();
         auto writer = wav.createWriterFor(
             stream,
             juce::AudioFormatWriterOptions{}.withSampleRate(kSR).withNumChannels(kCh).withBitsPerSample(24));
