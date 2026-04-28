@@ -15,3 +15,4 @@ tauri = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 patchbay-core = { path = "../patchbay-core" }
+chrono = { version = "0.4" }

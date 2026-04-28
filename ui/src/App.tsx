@@ -15,6 +15,12 @@ interface ScanResult {
   errors: string[];
 }
 
+interface ExportResult {
+  plugin_count: number;
+  json_path: string;
+  html_path: string;
+}
+
 const FORMAT_COLORS: Record<string, string> = {
   VST3: "text-blue-400",
   AU:   "text-green-400",
@@ -29,6 +35,9 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [selectedPlugin, setSelectedPlugin] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [exportResult, setExportResult] = useState<ExportResult | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<Plugin[]>("list_plugins")
@@ -49,6 +58,26 @@ export default function App() {
     } finally {
       setScanning(false);
     }
+  }
+
+  async function exportDossier() {
+    setExporting(true);
+    setExportError(null);
+    setExportResult(null);
+    try {
+      const result = await invoke<ExportResult>("export_library_dossier");
+      setExportResult(result);
+    } catch (e) {
+      setExportError(String(e));
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  async function openPath(path: string) {
+    try {
+      await invoke("open_path", { path });
+    } catch (_) {}
   }
 
   if (selectedPlugin !== null) {
@@ -107,6 +136,14 @@ export default function App() {
         />
 
         <button
+          onClick={exportDossier}
+          disabled={exporting || plugins.length === 0}
+          className="bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 border border-zinc-700 rounded px-3 py-1 text-xs transition-colors"
+        >
+          {exporting ? "Exporting…" : "Export Dossier"}
+        </button>
+
+        <button
           onClick={scan}
           disabled={scanning}
           className="bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 border border-zinc-700 rounded px-3 py-1 text-xs transition-colors"
@@ -119,6 +156,38 @@ export default function App() {
       {error && (
         <div className="px-4 py-2 text-red-400 text-xs border-b border-zinc-800">
           {error}
+        </div>
+      )}
+
+      {/* Export error */}
+      {exportError && (
+        <div className="flex items-center gap-3 px-4 py-2 text-red-400 text-xs border-b border-zinc-800">
+          <span>Export failed: {exportError}</span>
+          <button onClick={() => setExportError(null)} className="text-zinc-600 hover:text-zinc-400">✕</button>
+        </div>
+      )}
+
+      {/* Export success banner */}
+      {exportResult && (
+        <div className="flex items-center gap-3 px-4 py-2 text-xs border-b border-zinc-800 bg-zinc-900/60">
+          <span className="text-green-400">✓</span>
+          <span className="text-zinc-400">
+            Exported {exportResult.plugin_count} plugins to{" "}
+            <span className="text-zinc-300 font-medium">{exportResult.html_path}</span>
+          </span>
+          <button
+            onClick={() => openPath(exportResult.html_path)}
+            className="text-blue-400 hover:text-blue-300 underline"
+          >
+            Open HTML
+          </button>
+          <button
+            onClick={() => openPath(exportResult.json_path)}
+            className="text-blue-400 hover:text-blue-300 underline"
+          >
+            Open JSON
+          </button>
+          <button onClick={() => setExportResult(null)} className="ml-auto text-zinc-600 hover:text-zinc-400">✕</button>
         </div>
       )}
 

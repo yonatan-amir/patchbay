@@ -3,6 +3,7 @@ mod migrations;
 use std::collections::HashMap;
 use std::path::Path;
 use rusqlite::Connection;
+use serde::Serialize;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -48,6 +49,24 @@ pub struct PluginDetail {
     pub category: Option<String>,
     pub instances: Vec<PluginFormatInstance>,
     pub note: String,
+}
+
+#[derive(Serialize)]
+pub struct DossierInstance {
+    pub format: String,
+    pub path: String,
+    pub version: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DossierPlugin {
+    pub name: String,
+    pub vendor: Option<String>,
+    pub category: Option<String>,
+    pub formats: Vec<String>,
+    pub instances: Vec<DossierInstance>,
+    pub note: Option<String>,
+    pub first_seen: String,
 }
 
 impl Database {
@@ -194,6 +213,83 @@ impl Database {
             rusqlite::params![plugin_id, body],
         )?;
         Ok(())
+    }
+
+    /// Return all plugins for this device grouped by name, with all format instances
+    /// and user note. Used to generate the library dossier export.
+    pub fn export_dossier(&self, device_id: &str) -> Result<Vec<DossierPlugin>, DbError> {
+        struct Row {
+            name: String,
+            vendor: Option<String>,
+            category: Option<String>,
+            format: String,
+            path: String,
+            version: Option<String>,
+            created_at: String,
+            note: Option<String>,
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT p.name, p.vendor, p.category, p.format, p.path, p.version, p.created_at, pn.body
+             FROM plugins p
+             LEFT JOIN plugin_notes pn ON pn.plugin_id = p.id
+             WHERE p.device_id = ?1
+             ORDER BY p.name COLLATE NOCASE, p.id ASC",
+        )?;
+
+        let rows: Vec<Row> = stmt
+            .query_map([device_id], |row| {
+                Ok(Row {
+                    name: row.get(0)?,
+                    vendor: row.get(1)?,
+                    category: row.get(2)?,
+                    format: row.get(3)?,
+                    path: row.get(4)?,
+                    version: row.get(5)?,
+                    created_at: row.get(6)?,
+                    note: row.get(7)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut plugins: Vec<DossierPlugin> = Vec::new();
+        for row in rows {
+            if let Some(last) = plugins.last_mut() {
+                if last.name == row.name {
+                    if !last.formats.contains(&row.format) {
+                        last.formats.push(row.format.clone());
+                    }
+                    last.instances.push(DossierInstance {
+                        format: row.format,
+                        path: row.path,
+                        version: row.version,
+                    });
+                    if last.note.is_none() {
+                        last.note = row.note;
+                    }
+                    if row.created_at < last.first_seen {
+                        last.first_seen = row.created_at;
+                    }
+                    continue;
+                }
+            }
+            plugins.push(DossierPlugin {
+                formats: vec![row.format.clone()],
+                instances: vec![DossierInstance {
+                    format: row.format,
+                    path: row.path,
+                    version: row.version,
+                }],
+                note: row.note,
+                first_seen: row.created_at,
+                name: row.name,
+                vendor: row.vendor,
+                category: row.category,
+            });
+        }
+
+        Ok(plugins)
     }
 
     /// Return a map of `path → file_mtime` for all indexed plugins on this device
