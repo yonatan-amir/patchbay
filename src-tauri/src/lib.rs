@@ -27,13 +27,6 @@ struct FormatInstance {
 }
 
 #[derive(Serialize)]
-struct ManualEntry {
-    id: i64,
-    source: String,
-    path_or_url: String,
-}
-
-#[derive(Serialize)]
 struct PluginDetailEntry {
     id: i64,
     name: String,
@@ -41,7 +34,6 @@ struct PluginDetailEntry {
     category: Option<String>,
     instances: Vec<FormatInstance>,
     note: String,
-    manuals: Vec<ManualEntry>,
 }
 
 fn device_id() -> String {
@@ -110,7 +102,7 @@ fn list_plugins(state: tauri::State<'_, Mutex<Database>>) -> Result<Vec<PluginEn
     }).collect())
 }
 
-/// Return full detail for a plugin by name: all format instances, user note, and manuals.
+/// Return full detail for a plugin by name: all format instances and user note.
 #[tauri::command]
 fn get_plugin_detail(name: String, state: tauri::State<'_, Mutex<Database>>) -> Result<Option<PluginDetailEntry>, String> {
     let did = device_id();
@@ -127,11 +119,6 @@ fn get_plugin_detail(name: String, state: tauri::State<'_, Mutex<Database>>) -> 
             version: i.version,
         }).collect(),
         note: d.note,
-        manuals: d.manuals.into_iter().map(|m| ManualEntry {
-            id: m.id,
-            source: m.source,
-            path_or_url: m.path_or_url,
-        }).collect(),
     }))
 }
 
@@ -140,20 +127,6 @@ fn get_plugin_detail(name: String, state: tauri::State<'_, Mutex<Database>>) -> 
 fn save_plugin_note(plugin_id: i64, body: String, state: tauri::State<'_, Mutex<Database>>) -> Result<(), String> {
     let db = state.lock().map_err(|e| e.to_string())?;
     db.upsert_plugin_note(plugin_id, &body).map_err(|e| e.to_string())
-}
-
-/// Attach a manual URL or local path to a plugin.
-#[tauri::command]
-fn save_plugin_manual(plugin_id: i64, source: String, path_or_url: String, state: tauri::State<'_, Mutex<Database>>) -> Result<i64, String> {
-    let db = state.lock().map_err(|e| e.to_string())?;
-    db.save_plugin_manual(plugin_id, &source, &path_or_url).map_err(|e| e.to_string())
-}
-
-/// Remove a manual entry by id.
-#[tauri::command]
-fn delete_plugin_manual(manual_id: i64, state: tauri::State<'_, Mutex<Database>>) -> Result<(), String> {
-    let db = state.lock().map_err(|e| e.to_string())?;
-    db.delete_plugin_manual(manual_id).map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -171,8 +144,6 @@ pub fn run() {
             list_plugins,
             get_plugin_detail,
             save_plugin_note,
-            save_plugin_manual,
-            delete_plugin_manual,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

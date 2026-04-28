@@ -221,4 +221,8 @@ Migration {
         -- Allows AU / VST3 multi-component bundles to expand fully.
         CREATE UNIQUE INDEX idx_plugins_path_class ON plugins(path, class_id);
     ",
+},
+Migration {
+    version: 6,
+    sql: "DROP TABLE IF EXISTS plugin_manuals;",
 }];

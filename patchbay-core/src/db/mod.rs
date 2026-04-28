@@ -41,12 +41,6 @@ pub struct PluginFormatInstance {
     pub version: Option<String>,
 }
 
-pub struct PluginManual {
-    pub id: i64,
-    pub source: String,
-    pub path_or_url: String,
-}
-
 pub struct PluginDetail {
     pub id: i64,
     pub name: String,
@@ -54,7 +48,6 @@ pub struct PluginDetail {
     pub category: Option<String>,
     pub instances: Vec<PluginFormatInstance>,
     pub note: String,
-    pub manuals: Vec<PluginManual>,
 }
 
 impl Database {
@@ -119,9 +112,9 @@ impl Database {
         Ok(rows)
     }
 
-    /// Return all format instances for a plugin name, plus user note and manuals.
+    /// Return all format instances for a plugin name, plus user note.
     /// Groups every row with matching name (VST3 + AU + VST2 may all exist).
-    /// The primary row (lowest id) is used as the anchor for notes and manuals.
+    /// The primary row (lowest id) is used as the anchor for the note.
     pub fn get_plugin_detail(&self, name: &str, device_id: &str) -> Result<Option<PluginDetail>, DbError> {
         struct Row {
             id: i64,
@@ -180,22 +173,6 @@ impl Database {
             )
             .unwrap_or_default();
 
-        let mut manual_stmt = self.conn.prepare(
-            "SELECT id, source, path_or_url FROM plugin_manuals
-             WHERE plugin_id = ?1
-             ORDER BY id",
-        )?;
-        let manuals: Vec<PluginManual> = manual_stmt
-            .query_map([primary_id], |row| {
-                Ok(PluginManual {
-                    id: row.get(0)?,
-                    source: row.get(1)?,
-                    path_or_url: row.get(2)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
         Ok(Some(PluginDetail {
             id: primary_id,
             name: name.to_string(),
@@ -203,7 +180,6 @@ impl Database {
             category,
             instances,
             note,
-            manuals,
         }))
     }
 
@@ -216,25 +192,6 @@ impl Database {
                  body       = excluded.body,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
             rusqlite::params![plugin_id, body],
-        )?;
-        Ok(())
-    }
-
-    /// Attach a manual reference (URL or local path) to a plugin row.
-    /// Returns the new manual's row id.
-    pub fn save_plugin_manual(&self, plugin_id: i64, source: &str, path_or_url: &str) -> Result<i64, DbError> {
-        self.conn.execute(
-            "INSERT INTO plugin_manuals (plugin_id, source, path_or_url) VALUES (?1, ?2, ?3)",
-            rusqlite::params![plugin_id, source, path_or_url],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    /// Remove a manual entry by its id.
-    pub fn delete_plugin_manual(&self, manual_id: i64) -> Result<(), DbError> {
-        self.conn.execute(
-            "DELETE FROM plugin_manuals WHERE id = ?1",
-            [manual_id],
         )?;
         Ok(())
     }
@@ -417,31 +374,4 @@ mod tests {
         assert_eq!(detail3.note, "Updated note");
     }
 
-    #[test]
-    fn save_and_delete_plugin_manual() {
-        let db = Database::open_in_memory().unwrap();
-        db.upsert_plugin(&PluginRecord {
-            sync_id: "y".to_string(),
-            name: "TestPlugin".to_string(),
-            vendor: None,
-            format: "VST3".to_string(),
-            path: "/p/y.vst3".to_string(),
-            version: None,
-            class_id: None,
-            category: None,
-            device_id: "dev1".to_string(),
-            file_mtime: None,
-        }).unwrap();
-
-        let detail = db.get_plugin_detail("TestPlugin", "dev1").unwrap().unwrap();
-        let mid = db.save_plugin_manual(detail.id, "url", "https://example.com/manual.pdf").unwrap();
-
-        let detail2 = db.get_plugin_detail("TestPlugin", "dev1").unwrap().unwrap();
-        assert_eq!(detail2.manuals.len(), 1);
-        assert_eq!(detail2.manuals[0].source, "url");
-
-        db.delete_plugin_manual(mid).unwrap();
-        let detail3 = db.get_plugin_detail("TestPlugin", "dev1").unwrap().unwrap();
-        assert!(detail3.manuals.is_empty());
-    }
 }

@@ -7,12 +7,6 @@ interface FormatInstance {
   version: string | null;
 }
 
-interface ManualEntry {
-  id: number;
-  source: string;
-  path_or_url: string;
-}
-
 interface PluginDetailData {
   id: number;
   name: string;
@@ -20,7 +14,6 @@ interface PluginDetailData {
   category: string | null;
   instances: FormatInstance[];
   note: string;
-  manuals: ManualEntry[];
 }
 
 const FORMAT_COLORS: Record<string, string> = {
@@ -41,7 +34,6 @@ export default function PluginDetail({ name, onBack }: PluginDetailProps) {
   const [note, setNote] = useState("");
   const [noteDirty, setNoteDirty] = useState(false);
   const [noteSaved, setNoteSaved] = useState(false);
-  const [newManual, setNewManual] = useState("");
 
   useEffect(() => {
     setLoading(true);
@@ -60,22 +52,6 @@ export default function PluginDetail({ name, onBack }: PluginDetailProps) {
     setNoteDirty(false);
     setNoteSaved(true);
     setTimeout(() => setNoteSaved(false), 2000);
-  }
-
-  async function addManual() {
-    if (!detail || !newManual.trim()) return;
-    const val = newManual.trim();
-    const source = val.startsWith("http://") || val.startsWith("https://") ? "url" : "local";
-    await invoke("save_plugin_manual", { pluginId: detail.id, source, pathOrUrl: val });
-    const updated = await invoke<PluginDetailData | null>("get_plugin_detail", { name });
-    setDetail(updated);
-    setNewManual("");
-  }
-
-  async function deleteManual(id: number) {
-    await invoke("delete_plugin_manual", { manualId: id });
-    const updated = await invoke<PluginDetailData | null>("get_plugin_detail", { name });
-    setDetail(updated);
   }
 
   if (loading) {
@@ -150,45 +126,6 @@ export default function PluginDetail({ name, onBack }: PluginDetailProps) {
           <div>
             <SectionLabel>License</SectionLabel>
             <p className="text-sm mt-1 text-zinc-600">Not detected</p>
-          </div>
-        </section>
-
-        {/* Manual */}
-        <section>
-          <SectionLabel>Manual</SectionLabel>
-          {detail.manuals.length > 0 && (
-            <div className="space-y-1 mb-2">
-              {detail.manuals.map((m) => (
-                <div key={m.id} className="flex items-center gap-2 text-xs">
-                  <span className="text-zinc-500 shrink-0">{m.source === "url" ? "↗" : "↗"}</span>
-                  <span className="text-zinc-300 font-mono truncate flex-1">{m.path_or_url}</span>
-                  <button
-                    onClick={() => deleteManual(m.id)}
-                    className="text-zinc-600 hover:text-red-400 transition-colors px-1 shrink-0"
-                    aria-label="Remove manual"
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-          <div className="flex gap-2 mt-1">
-            <input
-              type="text"
-              placeholder="Paste URL or file path…"
-              value={newManual}
-              onChange={(e) => setNewManual(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && addManual()}
-              className="flex-1 bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs focus:outline-none focus:border-zinc-500"
-            />
-            <button
-              onClick={addManual}
-              disabled={!newManual.trim()}
-              className="bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 border border-zinc-700 rounded px-3 py-1 text-xs transition-colors"
-            >
-              Add
-            </button>
           </div>
         </section>
 
