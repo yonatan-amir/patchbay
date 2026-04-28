@@ -40,3 +40,9 @@ target_link_libraries(HeadlessHost PRIVATE
     juce_recommended_config_flags
     juce_recommended_warning_flags
 )
+
+# AUGenericView lives in CoreAudioKit — required at link time for AU hosting
+# even if we never instantiate the view at runtime.
+if(APPLE)
+    target_link_libraries(HeadlessHost PRIVATE "-framework CoreAudioKit")
+endif()
