@@ -1,1 +1,18 @@
 @import "tailwindcss";
+
+/* Markdown preview inside the dark notes pane */
+.prose-note { color: #d4d4d8; line-height: 1.6; }
+.prose-note p { margin: 0 0 0.5em; }
+.prose-note p:last-child { margin-bottom: 0; }
+.prose-note h1,.prose-note h2,.prose-note h3 { font-weight: 600; margin: 0.75em 0 0.25em; color: #fafafa; }
+.prose-note h1 { font-size: 1em; }
+.prose-note h2 { font-size: 0.9em; }
+.prose-note h3 { font-size: 0.85em; }
+.prose-note ul,.prose-note ol { padding-left: 1.25em; margin: 0 0 0.5em; }
+.prose-note li { margin: 0.15em 0; }
+.prose-note code { background: #27272a; border-radius: 3px; padding: 0.1em 0.35em; font-family: ui-monospace,monospace; font-size: 0.95em; color: #a5b4fc; }
+.prose-note pre { background: #18181b; border-radius: 6px; padding: 0.6em 0.85em; overflow-x: auto; margin: 0.5em 0; }
+.prose-note pre code { background: transparent; padding: 0; color: #d4d4d8; }
+.prose-note strong { color: #fafafa; font-weight: 600; }
+.prose-note em { color: #a1a1aa; }
+.prose-note blockquote { border-left: 3px solid #3f3f46; margin: 0.5em 0; padding-left: 0.75em; color: #71717a; }

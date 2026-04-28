@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import ReactMarkdown from "react-markdown";
 
 interface FormatInstance {
   format: string;
@@ -34,6 +35,7 @@ export default function PluginDetail({ name, onBack }: PluginDetailProps) {
   const [note, setNote] = useState("");
   const [noteDirty, setNoteDirty] = useState(false);
   const [noteSaved, setNoteSaved] = useState(false);
+  const [noteMode, setNoteMode] = useState<"edit" | "preview">("edit");
 
   useEffect(() => {
     setLoading(true);
@@ -131,14 +133,43 @@ export default function PluginDetail({ name, onBack }: PluginDetailProps) {
 
         {/* Notes */}
         <section>
-          <SectionLabel>Notes</SectionLabel>
-          <textarea
-            value={note}
-            onChange={(e) => { setNote(e.target.value); setNoteDirty(true); setNoteSaved(false); }}
-            placeholder="Your notes about this plugin…"
-            rows={5}
-            className="w-full mt-1 bg-zinc-900 border border-zinc-700 rounded px-3 py-2 text-xs focus:outline-none focus:border-zinc-500 resize-none font-mono"
-          />
+          <div className="flex items-center justify-between mb-2">
+            <SectionLabel>Notes</SectionLabel>
+            <div className="flex text-xs border border-zinc-700 rounded overflow-hidden">
+              {(["edit", "preview"] as const).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setNoteMode(m)}
+                  className={`px-2.5 py-1 capitalize transition-colors ${
+                    noteMode === m
+                      ? "bg-zinc-700 text-white"
+                      : "bg-transparent text-zinc-500 hover:text-zinc-300"
+                  }`}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {noteMode === "edit" ? (
+            <textarea
+              value={note}
+              onChange={(e) => { setNote(e.target.value); setNoteDirty(true); setNoteSaved(false); }}
+              placeholder="Your notes about this plugin… (supports Markdown)"
+              rows={6}
+              className="w-full bg-zinc-900 border border-zinc-700 rounded px-3 py-2 text-xs focus:outline-none focus:border-zinc-500 resize-none font-mono"
+            />
+          ) : (
+            <div className="w-full min-h-[7.5rem] bg-zinc-900 border border-zinc-700 rounded px-3 py-2 text-xs prose-note">
+              {note.trim() ? (
+                <ReactMarkdown>{note}</ReactMarkdown>
+              ) : (
+                <span className="text-zinc-600">Nothing here yet.</span>
+              )}
+            </div>
+          )}
+
           <div className="flex items-center gap-3 mt-1.5">
             <button
               onClick={saveNote}
@@ -168,6 +199,6 @@ function BackNav({ onBack }: { onBack: () => void }) {
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
-    <p className="text-xs text-zinc-500 uppercase tracking-widest mb-2">{children}</p>
+    <p className="text-xs text-zinc-500 uppercase tracking-widest">{children}</p>
   );
 }
