@@ -13,7 +13,10 @@ FetchContent_Declare(JUCE
 )
 FetchContent_MakeAvailable(JUCE)
 
-juce_add_console_app(HeadlessHost PRODUCT_NAME "HeadlessHost")
+juce_add_gui_app(HeadlessHost
+    PRODUCT_NAME    "HeadlessHost"
+    BUNDLE_ID       "com.patchbay.headlesshost"
+)
 juce_generate_juce_header(HeadlessHost)
 
 target_sources(HeadlessHost PRIVATE main.cpp)
