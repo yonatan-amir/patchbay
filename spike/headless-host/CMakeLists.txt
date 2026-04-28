@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(FetchContent)
 FetchContent_Declare(JUCE
     GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
-    GIT_TAG        main
+    GIT_TAG        8.0.12
     GIT_SHALLOW    TRUE
     GIT_PROGRESS   TRUE
 )
