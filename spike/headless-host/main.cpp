@@ -34,7 +34,7 @@ static juce::String makeTone() {
     juce::WavAudioFormat wav;
     auto stream = f.createOutputStream();
     auto writer = wav.createWriterFor(
-        std::move(stream),
+        stream,
         juce::AudioFormatWriterOptions{}.withSampleRate(kSR).withNumChannels(kCh).withBitsPerSample(24));
     if (writer) writer->writeFromAudioSampleBuffer(buf, 0, n);
     return path;
@@ -59,9 +59,9 @@ static PluginArg parsePluginArg(const juce::String& arg) {
 class Host {
 public:
     Host() {
-        fmt.addFormat(new juce::VST3PluginFormat());
+        fmt.addFormat(std::make_unique<juce::VST3PluginFormat>());
 #if JUCE_PLUGINHOST_AU
-        fmt.addFormat(new juce::AudioUnitPluginFormat());
+        fmt.addFormat(std::make_unique<juce::AudioUnitPluginFormat>());
 #endif
     }
 
@@ -204,7 +204,7 @@ public:
         juce::WavAudioFormat wav;
         auto stream = outFile.createOutputStream();
         auto writer = wav.createWriterFor(
-            std::move(stream),
+            stream,
             juce::AudioFormatWriterOptions{}.withSampleRate(kSR).withNumChannels(kCh).withBitsPerSample(24));
         if (!writer) {
             std::cerr << "  [!] cannot create WAV writer\n";
