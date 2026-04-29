@@ -255,11 +255,38 @@ function ChainCard({
   onDelete: (id: number) => void;
 }) {
   const [hover, setHover] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportedPath, setExportedPath] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+
   const tags = chain.tags
     ?.split(",")
     .map(t => t.trim())
     .filter(Boolean) ?? [];
   const date = chain.created_at.slice(0, 10);
+
+  async function handleExport() {
+    setExporting(true);
+    setExportedPath(null);
+    setExportError(null);
+    try {
+      const path = await invoke<string>("export_chain", { chainId: chain.id });
+      setExportedPath(path);
+    } catch (e) {
+      setExportError(String(e));
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  function openFolder() {
+    if (!exportedPath) return;
+    const dir = exportedPath.replace(/[/\\][^/\\]+$/, "");
+    invoke("open_path", { path: dir }).catch(() => {});
+  }
+
+  const exportLabel = `Export for ${chain.daw}`;
+  const exportedFilename = exportedPath?.split(/[/\\]/).pop() ?? "";
 
   return (
     <div
@@ -292,16 +319,42 @@ function ChainCard({
               ))}
             </div>
           )}
+          {exportedPath && (
+            <div className="flex items-center gap-2 mt-1.5">
+              <span className="text-xs text-green-500 font-mono truncate max-w-[160px]">
+                {exportedFilename}
+              </span>
+              <button
+                onClick={openFolder}
+                className="text-xs text-zinc-500 hover:text-zinc-300 transition-colors shrink-0"
+              >
+                Open folder
+              </button>
+            </div>
+          )}
+          {exportError && (
+            <div className="text-xs text-red-400 mt-1 leading-snug">{exportError}</div>
+          )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <span className="text-xs text-zinc-700">{date}</span>
           {hover && (
-            <button
-              onClick={() => onDelete(chain.id)}
-              className="text-xs text-zinc-600 hover:text-red-400 transition-colors"
-            >
-              ✕
-            </button>
+            <>
+              <button
+                onClick={handleExport}
+                disabled={exporting}
+                className="text-xs bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded px-2 py-0.5 transition-colors disabled:opacity-40"
+                title={exportLabel}
+              >
+                {exporting ? "…" : "Export"}
+              </button>
+              <button
+                onClick={() => onDelete(chain.id)}
+                className="text-xs text-zinc-600 hover:text-red-400 transition-colors"
+              >
+                ✕
+              </button>
+            </>
           )}
         </div>
       </div>

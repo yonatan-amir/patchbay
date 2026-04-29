@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod daw_readers;
+pub mod daw_writers;
 pub mod db;
 pub mod indexer;
 pub mod live_project;

@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
+use patchbay_core::daw_writers::{ableton, dawproject, logicpro, reaper};
 use patchbay_core::db::{
     ChainDetail, ChainRecord, ChainRow, ChainSlotRecord, Database, DossierPlugin,
 };
@@ -291,6 +292,66 @@ fn delete_chain(
     db.delete_chain(chain_id).map_err(|e| e.to_string())
 }
 
+/// Export a saved chain to a native DAW preset file.
+///
+/// Writes to `~/Documents/Patchbay/exports/<name>.<ext>` and returns the
+/// full path so the frontend can reveal it in Finder / Explorer.
+///
+/// Supported DAWs (same-DAW round-trip):
+/// - Ableton → `.adg` (gzipped XML rack)
+/// - Reaper → `.RfxChain` (plain-text FXCHAIN block)
+/// - Bitwig Studio / Studio One → `.dawproject` (ZIP + XML)
+/// - Logic → not yet implemented (needs macOS sample file inspection)
+#[tauri::command]
+fn export_chain(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, Mutex<Database>>,
+    chain_id: i64,
+) -> Result<String, String> {
+    let chain = {
+        let db = db.lock().map_err(|e| e.to_string())?;
+        db.get_chain(chain_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Chain {chain_id} not found"))?
+    };
+
+    let docs = app.path().document_dir().map_err(|e| e.to_string())?;
+    let out_dir = docs.join("Patchbay").join("exports");
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+
+    let safe_name: String = chain
+        .name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
+        .collect();
+
+    let (ext, content): (&str, Vec<u8>) = match chain.daw.as_str() {
+        "Ableton" => {
+            let bytes = ableton::write_adg(&chain)?;
+            ("adg", bytes)
+        }
+        "Reaper" => {
+            let text = reaper::write_rfxchain(&chain.slots);
+            ("RfxChain", text.into_bytes())
+        }
+        "Logic" => {
+            return Err(logicpro::write_cst(&chain).unwrap_err());
+        }
+        daw => {
+            // Bitwig Studio, Studio One, DAWproject-based DAWs
+            let bytes = dawproject::write_dawproject(&chain)
+                .map_err(|e| format!("DAWproject export failed for {daw}: {e}"))?;
+            ("dawproject", bytes)
+        }
+    };
+
+    let filename = format!("{safe_name}.{ext}");
+    let path = out_dir.join(&filename);
+    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+
+    Ok(path.to_string_lossy().into_owned())
+}
+
 /// Return the live project currently open in a DAW, if any.
 #[tauri::command]
 fn get_live_project(
@@ -391,6 +452,7 @@ pub fn run() {
             list_chains,
             get_chain,
             delete_chain,
+            export_chain,
             get_live_project,
         ])
         .run(tauri::generate_context!())
