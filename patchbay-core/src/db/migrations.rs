@@ -225,4 +225,38 @@ Migration {
 Migration {
     version: 6,
     sql: "DROP TABLE IF EXISTS plugin_manuals;",
+},
+Migration {
+    version: 7,
+    sql: "
+        -- Expand chains with user metadata
+        ALTER TABLE chains ADD COLUMN tags         TEXT;
+        ALTER TABLE chains ADD COLUMN source_track TEXT;
+        ALTER TABLE chains ADD COLUMN notes        TEXT;
+
+        -- Rebuild chain_slots: make plugin_id a soft (nullable) FK,
+        -- rename params→opaque_state, add plugin_identity/bypass/wet/preset_name.
+        CREATE TABLE chain_slots_v2 (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain_id        INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
+            plugin_id       INTEGER REFERENCES plugins(id),
+            plugin_identity TEXT    NOT NULL DEFAULT '{}',
+            position        INTEGER NOT NULL,
+            bypass          INTEGER NOT NULL DEFAULT 0,
+            wet             REAL    NOT NULL DEFAULT 1.0,
+            preset_name     TEXT,
+            opaque_state    TEXT,
+            UNIQUE(chain_id, position)
+        );
+
+        INSERT INTO chain_slots_v2
+            (id, chain_id, plugin_id, plugin_identity, position, opaque_state)
+        SELECT id, chain_id, plugin_id, '{}', position, params
+        FROM chain_slots;
+
+        DROP TABLE chain_slots;
+        ALTER TABLE chain_slots_v2 RENAME TO chain_slots;
+
+        CREATE INDEX idx_chain_slots_chain_id ON chain_slots(chain_id);
+    ",
 }];

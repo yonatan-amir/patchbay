@@ -69,6 +69,64 @@ pub struct DossierPlugin {
     pub first_seen: String,
 }
 
+// ── Chain types ─────────────────────────────────────────────────────────────
+
+pub struct ChainRecord {
+    pub sync_id: String,
+    pub name: String,
+    pub daw: String,
+    pub source_track: Option<String>,
+    pub notes: Option<String>,
+    pub tags: Option<String>,
+    pub device_id: String,
+}
+
+pub struct ChainSlotRecord {
+    pub plugin_id: Option<i64>,
+    pub plugin_identity: String,
+    pub position: i32,
+    pub bypass: bool,
+    pub wet: f64,
+    pub preset_name: Option<String>,
+    pub opaque_state: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ChainRow {
+    pub id: i64,
+    pub sync_id: String,
+    pub name: String,
+    pub daw: String,
+    pub tags: Option<String>,
+    pub source_track: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Serialize)]
+pub struct ChainSlotRow {
+    pub id: i64,
+    pub plugin_id: Option<i64>,
+    pub plugin_identity: String,
+    pub position: i32,
+    pub bypass: bool,
+    pub wet: f64,
+    pub preset_name: Option<String>,
+    pub opaque_state: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ChainDetail {
+    pub id: i64,
+    pub sync_id: String,
+    pub name: String,
+    pub daw: String,
+    pub source_track: Option<String>,
+    pub notes: Option<String>,
+    pub tags: Option<String>,
+    pub created_at: String,
+    pub slots: Vec<ChainSlotRow>,
+}
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
@@ -307,6 +365,154 @@ impl Database {
         Ok(map)
     }
 
+    // ── Chain CRUD ───────────────────────────────────────────────────────────
+
+    /// Upsert a chain (keyed on sync_id) and replace all its slots atomically.
+    /// Returns the chain's row id.
+    pub fn save_chain(&self, chain: &ChainRecord, slots: &[ChainSlotRecord]) -> Result<i64, DbError> {
+        self.conn.execute_batch("BEGIN")?;
+
+        let result = (|| -> Result<i64, DbError> {
+            self.conn.execute(
+                "INSERT INTO chains (sync_id, name, daw, source_track, notes, tags, device_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(sync_id) DO UPDATE SET
+                     name         = excluded.name,
+                     daw          = excluded.daw,
+                     source_track = excluded.source_track,
+                     notes        = excluded.notes,
+                     tags         = excluded.tags,
+                     updated_at   = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+                rusqlite::params![
+                    chain.sync_id, chain.name, chain.daw,
+                    chain.source_track, chain.notes, chain.tags, chain.device_id
+                ],
+            )?;
+            // last_insert_rowid() is unreliable for ON CONFLICT DO UPDATE — query explicitly.
+            let chain_id: i64 = self.conn.query_row(
+                "SELECT id FROM chains WHERE sync_id = ?1",
+                [&chain.sync_id],
+                |row| row.get(0),
+            )?;
+
+            self.conn.execute(
+                "DELETE FROM chain_slots WHERE chain_id = ?1",
+                [chain_id],
+            )?;
+
+            for slot in slots {
+                self.conn.execute(
+                    "INSERT INTO chain_slots
+                         (chain_id, plugin_id, plugin_identity, position,
+                          bypass, wet, preset_name, opaque_state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        chain_id,
+                        slot.plugin_id,
+                        slot.plugin_identity,
+                        slot.position,
+                        slot.bypass as i32,
+                        slot.wet,
+                        slot.preset_name,
+                        slot.opaque_state,
+                    ],
+                )?;
+            }
+
+            Ok(chain_id)
+        })();
+
+        match result {
+            Ok(id) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(id)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    pub fn list_chains(&self, device_id: &str) -> Result<Vec<ChainRow>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, sync_id, name, daw, tags, source_track, created_at
+             FROM chains
+             WHERE device_id = ?1
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([device_id], |row| {
+                Ok(ChainRow {
+                    id: row.get(0)?,
+                    sync_id: row.get(1)?,
+                    name: row.get(2)?,
+                    daw: row.get(3)?,
+                    tags: row.get(4)?,
+                    source_track: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn get_chain(&self, chain_id: i64) -> Result<Option<ChainDetail>, DbError> {
+        let chain = self.conn.query_row(
+            "SELECT id, sync_id, name, daw, source_track, notes, tags, created_at
+             FROM chains WHERE id = ?1",
+            [chain_id],
+            |row| {
+                Ok(ChainDetail {
+                    id: row.get(0)?,
+                    sync_id: row.get(1)?,
+                    name: row.get(2)?,
+                    daw: row.get(3)?,
+                    source_track: row.get(4)?,
+                    notes: row.get(5)?,
+                    tags: row.get(6)?,
+                    created_at: row.get(7)?,
+                    slots: Vec::new(),
+                })
+            },
+        );
+
+        let mut chain = match chain {
+            Ok(c) => c,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, plugin_id, plugin_identity, position, bypass, wet, preset_name, opaque_state
+             FROM chain_slots WHERE chain_id = ?1 ORDER BY position ASC",
+        )?;
+
+        chain.slots = stmt
+            .query_map([chain_id], |row| {
+                Ok(ChainSlotRow {
+                    id: row.get(0)?,
+                    plugin_id: row.get(1)?,
+                    plugin_identity: row.get(2)?,
+                    position: row.get(3)?,
+                    bypass: row.get::<_, i32>(4)? != 0,
+                    wet: row.get(5)?,
+                    preset_name: row.get(6)?,
+                    opaque_state: row.get(7)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(Some(chain))
+    }
+
+    pub fn delete_chain(&self, chain_id: i64) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM chains WHERE id = ?1", [chain_id])?;
+        Ok(())
+    }
+
     fn run_migrations(&self) -> Result<(), DbError> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -440,6 +646,121 @@ mod tests {
         assert!(detail.instances.iter().any(|i| i.format == "VST3"));
         assert!(detail.instances.iter().any(|i| i.format == "AU"));
         assert_eq!(detail.note, "");
+    }
+
+    fn make_chain(sync_id: &str, device_id: &str) -> ChainRecord {
+        ChainRecord {
+            sync_id: sync_id.to_string(),
+            name: "Test Chain".to_string(),
+            daw: "Ableton".to_string(),
+            source_track: Some("Kick".to_string()),
+            notes: Some("Punchy".to_string()),
+            tags: Some("drums,kick".to_string()),
+            device_id: device_id.to_string(),
+        }
+    }
+
+    fn make_slots() -> Vec<ChainSlotRecord> {
+        vec![
+            ChainSlotRecord {
+                plugin_id: None,
+                plugin_identity: r#"{"name":"Pro-Q 3","vendor":"FabFilter","format":"VST3"}"#.to_string(),
+                position: 0,
+                bypass: false,
+                wet: 1.0,
+                preset_name: Some("Tight Low Cut".to_string()),
+                opaque_state: Some("abc123".to_string()),
+            },
+            ChainSlotRecord {
+                plugin_id: None,
+                plugin_identity: r#"{"name":"Pro-C 2","vendor":"FabFilter","format":"VST3"}"#.to_string(),
+                position: 1,
+                bypass: true,
+                wet: 0.5,
+                preset_name: None,
+                opaque_state: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn save_and_load_chain_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        let chain_id = db.save_chain(&make_chain("c1", "dev1"), &make_slots()).unwrap();
+
+        let detail = db.get_chain(chain_id).unwrap().unwrap();
+        assert_eq!(detail.name, "Test Chain");
+        assert_eq!(detail.daw, "Ableton");
+        assert_eq!(detail.source_track.as_deref(), Some("Kick"));
+        assert_eq!(detail.notes.as_deref(), Some("Punchy"));
+        assert_eq!(detail.tags.as_deref(), Some("drums,kick"));
+        assert_eq!(detail.slots.len(), 2);
+
+        let s0 = &detail.slots[0];
+        assert_eq!(s0.position, 0);
+        assert!(!s0.bypass);
+        assert_eq!(s0.wet, 1.0);
+        assert_eq!(s0.preset_name.as_deref(), Some("Tight Low Cut"));
+        assert_eq!(s0.opaque_state.as_deref(), Some("abc123"));
+
+        let s1 = &detail.slots[1];
+        assert_eq!(s1.position, 1);
+        assert!(s1.bypass);
+        assert_eq!(s1.wet, 0.5);
+        assert!(s1.preset_name.is_none());
+        assert!(s1.opaque_state.is_none());
+    }
+
+    #[test]
+    fn list_chains_device_isolation() {
+        let db = Database::open_in_memory().unwrap();
+        db.save_chain(&make_chain("c1", "dev1"), &[]).unwrap();
+        db.save_chain(&make_chain("c2", "dev2"), &[]).unwrap();
+
+        let dev1 = db.list_chains("dev1").unwrap();
+        let dev2 = db.list_chains("dev2").unwrap();
+        assert_eq!(dev1.len(), 1);
+        assert_eq!(dev2.len(), 1);
+        assert_eq!(dev1[0].sync_id, "c1");
+        assert_eq!(dev2[0].sync_id, "c2");
+    }
+
+    #[test]
+    fn delete_chain_cascades_slots() {
+        let db = Database::open_in_memory().unwrap();
+        let chain_id = db.save_chain(&make_chain("c1", "dev1"), &make_slots()).unwrap();
+
+        db.delete_chain(chain_id).unwrap();
+        assert!(db.get_chain(chain_id).unwrap().is_none());
+
+        let slot_count: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM chain_slots WHERE chain_id = ?1",
+            [chain_id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(slot_count, 0);
+    }
+
+    #[test]
+    fn save_chain_upsert_replaces_slots() {
+        let db = Database::open_in_memory().unwrap();
+        let chain_id = db.save_chain(&make_chain("c1", "dev1"), &make_slots()).unwrap();
+
+        let new_slots = vec![ChainSlotRecord {
+            plugin_id: None,
+            plugin_identity: r#"{"name":"Limiter","vendor":"FabFilter","format":"VST3"}"#.to_string(),
+            position: 0,
+            bypass: false,
+            wet: 1.0,
+            preset_name: None,
+            opaque_state: None,
+        }];
+        let same_id = db.save_chain(&make_chain("c1", "dev1"), &new_slots).unwrap();
+
+        assert_eq!(chain_id, same_id);
+        let detail = db.get_chain(chain_id).unwrap().unwrap();
+        assert_eq!(detail.slots.len(), 1);
+        assert!(detail.slots[0].plugin_identity.contains("Limiter"));
     }
 
     #[test]
