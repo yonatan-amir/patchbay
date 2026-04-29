@@ -27,8 +27,53 @@
 //! variable offset (~52–64 bytes from the `qeSM` tag). We locate it by
 //! scanning for the first valid `len_u16LE + ascii_bytes + '\0'` triplet.
 //!
-//! Plugin/device data (AU state blobs) lives in other sub-chunks not yet
-//! decoded; devices are returned empty in Phase 1.
+//! # Plugin / device data — investigation results (2026-04-29)
+//! Binary analysis of `Skyline Masher.logicx` (Logic 11.2, Live Loop Grid
+//! template) revealed the following structure:
+//!
+//! ## Track structure
+//! The five audio/instrument tracks begin at offset ~0x0b0dd as `karT` chunks.
+//! These are separate from ~130 `karT` chunks at the end of the file, which
+//! are MIDI device routing entries (IAC Driver, KeyStep, etc.).
+//!
+//! ## Effects channel-strip section (`GAME`/`TSPP`)
+//! Built-in Logic effects appear in a **global** section starting around
+//! 0x031c11, after a 150 KB audio-region data block. Each entry is:
+//! ```text
+//! [null_bytes][0x87 0x01 0x02 0x02]<name_str>\x00\x00
+//! GAME <flags:4B> <param_count:u32LE> ...
+//! GAMETSPP <param_count:u32LE> \x00... <param_count × f32LE params>
+//! <UUID:16B>
+//! UCuA <header> <0x1235:u32LE> <preset_name_cstr>
+//! ```
+//! `GAME` = "Generic Audio Module Effect"; `TSPP` = parameter table.
+//! Each UCuA sub-block contains an internal preset-path reference
+//! (`#default.pst`), **not** a raw AU state blob.
+//!
+//! The `GAME`/`TSPP` entries are NOT contained within `karT` track chunks;
+//! the association between a track and its effects channel strip cannot be
+//! determined without a format reference or test project with known mappings.
+//!
+//! ## bplist sections
+//! The 83 NSKeyedArchiver bplist blobs encode Smart Controls layout
+//! (`WsIdentity`, `WsPluginIdentity`, `MAPlugInParameterMapping`) and
+//! per-instrument MIDI layer settings (`MAKeyboardLayer`). They do NOT contain
+//! AU plugin state.
+//!
+//! ## Third-party AU plugins
+//! The test project (`Skyline Masher`) uses only Logic built-in effects.
+//! No third-party AU state blobs were observed. The format for external AUs
+//! (if embedded at all vs. referenced via library `.cst` files) is unknown.
+//!
+//! ## What is needed to unblock AU device decoding
+//! 1. A `.logicx` project containing at least one third-party AU plugin with
+//!    saved state (not a template referencing a library `.cst`).
+//! 2. Mapping from `karT` track indices to their `GAME` entries (no such
+//!    index structure has been located yet).
+//! 3. Once state blobs are found, AU component `type`/`subtype`/`manufacturer`
+//!    4CC codes must be captured — they are not present in `GAME`/`TSPP`.
+//!
+//! Devices are returned empty until the above are resolved.
 //!
 //! # Fallback
 //! Older Logic 9 projects used a plain plist dictionary. The reader detects
