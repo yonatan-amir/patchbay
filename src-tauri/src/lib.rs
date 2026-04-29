@@ -1,8 +1,12 @@
-use std::sync::Mutex;
-use serde::Serialize;
-use tauri::Manager;
-use patchbay_core::db::{Database, DossierPlugin};
-use patchbay_core::{indexer, scanner};
+use std::sync::{Arc, Mutex};
+use serde::{Deserialize, Serialize};
+use tauri::{Emitter, Manager};
+use patchbay_core::db::{
+    ChainDetail, ChainRecord, ChainRow, ChainSlotRecord, Database, DossierPlugin,
+};
+use patchbay_core::live_project::LiveProject;
+
+// ── Serialisable response types ───────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct PluginEntry {
@@ -43,16 +47,34 @@ struct ExportResult {
     html_path: String,
 }
 
+/// Input for a single chain slot sent from the frontend.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SlotInput {
+    position: i32,
+    bypass: bool,
+    wet: f64,
+    preset_name: Option<String>,
+    plugin_identity: serde_json::Value,
+    opaque_state: Option<String>,
+}
+
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
 fn device_id() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "local".to_string())
 }
 
+// ── Plugin commands ───────────────────────────────────────────────────────────
+
 /// Scan all plugin formats (VST3, VST2, CLAP, AU) against default system paths
 /// and persist results to SQLite. Bundles unchanged since the last scan are skipped.
 #[tauri::command]
 fn scan_plugins(state: tauri::State<'_, Mutex<Database>>) -> Result<ScanResult, String> {
+    use patchbay_core::{indexer, scanner};
+
     let did = device_id();
     let db = state.lock().map_err(|e| e.to_string())?;
     let known_mtimes = db.get_known_mtimes(&did).map_err(|e| e.to_string())?;
@@ -64,22 +86,24 @@ fn scan_plugins(state: tauri::State<'_, Mutex<Database>>) -> Result<ScanResult, 
     let mut total_skipped = 0usize;
     let mut all_errors: Vec<String> = Vec::new();
 
-    let (plugins, skipped, errors) = scanner::scan_vst3(&scanner::default_vst3_paths(), &known_mtimes);
+    let (plugins, skipped, errors) =
+        scanner::scan_vst3(&scanner::default_vst3_paths(), &known_mtimes);
     all_plugins.extend(plugins);
     total_skipped += skipped;
     all_errors.extend(errors.iter().map(|e| e.to_string()));
 
-    let (plugins, skipped, errors) = scanner::scan_vst2(&scanner::default_vst2_paths(), vst2_probe.as_deref(), &known_mtimes);
+    let (plugins, skipped, errors) =
+        scanner::scan_vst2(&scanner::default_vst2_paths(), vst2_probe.as_deref(), &known_mtimes);
     all_plugins.extend(plugins);
     total_skipped += skipped;
     all_errors.extend(errors.iter().map(|e| e.to_string()));
 
-    let (plugins, skipped, errors) = scanner::scan_clap(&scanner::default_clap_paths(), clap_probe.as_deref(), &known_mtimes);
+    let (plugins, skipped, errors) =
+        scanner::scan_clap(&scanner::default_clap_paths(), clap_probe.as_deref(), &known_mtimes);
     all_plugins.extend(plugins);
     total_skipped += skipped;
     all_errors.extend(errors.iter().map(|e| e.to_string()));
 
-    // scan_au returns empty on non-macOS; no cfg guard needed here
     let (plugins, skipped, errors) = scanner::scan_au();
     all_plugins.extend(plugins);
     total_skipped += skipped;
@@ -111,7 +135,10 @@ fn list_plugins(state: tauri::State<'_, Mutex<Database>>) -> Result<Vec<PluginEn
 
 /// Return full detail for a plugin by name: all format instances and user note.
 #[tauri::command]
-fn get_plugin_detail(name: String, state: tauri::State<'_, Mutex<Database>>) -> Result<Option<PluginDetailEntry>, String> {
+fn get_plugin_detail(
+    name: String,
+    state: tauri::State<'_, Mutex<Database>>,
+) -> Result<Option<PluginDetailEntry>, String> {
     let did = device_id();
     let db = state.lock().map_err(|e| e.to_string())?;
     let detail = db.get_plugin_detail(&name, &did).map_err(|e| e.to_string())?;
@@ -131,7 +158,11 @@ fn get_plugin_detail(name: String, state: tauri::State<'_, Mutex<Database>>) -> 
 
 /// Save or replace the user note for a plugin (identified by its primary row id).
 #[tauri::command]
-fn save_plugin_note(plugin_id: i64, body: String, state: tauri::State<'_, Mutex<Database>>) -> Result<(), String> {
+fn save_plugin_note(
+    plugin_id: i64,
+    body: String,
+    state: tauri::State<'_, Mutex<Database>>,
+) -> Result<(), String> {
     let db = state.lock().map_err(|e| e.to_string())?;
     db.upsert_plugin_note(plugin_id, &body).map_err(|e| e.to_string())
 }
@@ -155,7 +186,6 @@ fn export_library_dossier(
     let exported_at = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let date_slug = now.format("%Y-%m-%d").to_string();
 
-    // JSON export
     let json_path = out_dir.join(format!("plugin-dossier-{}.json", date_slug));
     let json_export = serde_json::json!({
         "exported_at": exported_at,
@@ -166,7 +196,6 @@ fn export_library_dossier(
     let json = serde_json::to_string_pretty(&json_export).map_err(|e| e.to_string())?;
     std::fs::write(&json_path, json).map_err(|e| e.to_string())?;
 
-    // HTML export
     let html_path = out_dir.join(format!("plugin-dossier-{}.html", date_slug));
     let html = render_dossier_html(&did, &plugins, &exported_at);
     std::fs::write(&html_path, html).map_err(|e| e.to_string())?;
@@ -178,8 +207,7 @@ fn export_library_dossier(
     })
 }
 
-/// Open a file or folder in the platform's default handler (browser for HTML,
-/// Finder/Explorer for directories).
+/// Open a file or folder in the platform's default handler.
 #[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -198,6 +226,178 @@ fn open_path(path: String) -> Result<(), String> {
     }
     Ok(())
 }
+
+// ── Chain commands ────────────────────────────────────────────────────────────
+
+/// Save a named, tagged chain from a live project track.
+#[tauri::command]
+fn save_chain(
+    db: tauri::State<'_, Mutex<Database>>,
+    name: String,
+    daw: String,
+    tags: Option<String>,
+    source_track: Option<String>,
+    notes: Option<String>,
+    slots: Vec<SlotInput>,
+) -> Result<i64, String> {
+    let did = device_id();
+    let db = db.lock().map_err(|e| e.to_string())?;
+    let chain = ChainRecord {
+        sync_id: patchbay_core::new_sync_id(),
+        name,
+        daw,
+        source_track,
+        notes,
+        tags,
+        device_id: did,
+    };
+    let slot_records: Vec<ChainSlotRecord> = slots.into_iter().map(|s| ChainSlotRecord {
+        plugin_id: None,
+        plugin_identity: s.plugin_identity.to_string(),
+        position: s.position,
+        bypass: s.bypass,
+        wet: s.wet,
+        preset_name: s.preset_name,
+        opaque_state: s.opaque_state,
+    }).collect();
+    db.save_chain(&chain, &slot_records).map_err(|e| e.to_string())
+}
+
+/// List all chains saved on this device, newest first.
+#[tauri::command]
+fn list_chains(db: tauri::State<'_, Mutex<Database>>) -> Result<Vec<ChainRow>, String> {
+    let did = device_id();
+    let db = db.lock().map_err(|e| e.to_string())?;
+    db.list_chains(&did).map_err(|e| e.to_string())
+}
+
+/// Return full detail for a chain including all slots.
+#[tauri::command]
+fn get_chain(
+    db: tauri::State<'_, Mutex<Database>>,
+    chain_id: i64,
+) -> Result<Option<ChainDetail>, String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    db.get_chain(chain_id).map_err(|e| e.to_string())
+}
+
+/// Delete a chain and all its slots.
+#[tauri::command]
+fn delete_chain(
+    db: tauri::State<'_, Mutex<Database>>,
+    chain_id: i64,
+) -> Result<(), String> {
+    let db = db.lock().map_err(|e| e.to_string())?;
+    db.delete_chain(chain_id).map_err(|e| e.to_string())
+}
+
+/// Return the live project currently open in a DAW, if any.
+#[tauri::command]
+fn get_live_project(
+    live: tauri::State<'_, Arc<Mutex<Option<LiveProject>>>>,
+) -> Result<Option<LiveProject>, String> {
+    live.lock().map(|g| g.clone()).map_err(|e| e.to_string())
+}
+
+// ── App entry point ───────────────────────────────────────────────────────────
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .setup(|app| {
+            // Database
+            let data_dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&data_dir)?;
+            let db = Database::open(&data_dir.join("patchbay.db"))?;
+            app.manage(Mutex::new(db));
+
+            // Shared live-project state
+            let live: Arc<Mutex<Option<LiveProject>>> = Arc::new(Mutex::new(None));
+            app.manage(Arc::clone(&live));
+
+            // Background thread: start watcher and forward its events to the frontend
+            let live2 = Arc::clone(&live);
+            let handle = app.handle().clone();
+            let _ = std::thread::Builder::new()
+                .name("patchbay-watcher-forwarder".into())
+                .spawn(move || {
+                    use patchbay_core::live_project;
+                    use patchbay_core::watcher::{WatchEvent, WatcherService};
+
+                    let watcher = WatcherService::start();
+                    let mut current_path = String::new();
+
+                    loop {
+                        match watcher.events().recv() {
+                            Ok(event) => match event {
+                                WatchEvent::ProjectOpened { path, daw } => {
+                                    current_path = path.to_string_lossy().into_owned();
+                                    let _ = handle.emit(
+                                        "project-opened",
+                                        serde_json::json!({
+                                            "path": current_path,
+                                            "daw": format!("{daw:?}"),
+                                        }),
+                                    );
+                                }
+                                WatchEvent::ProjectChanged { parsed } => {
+                                    if let Some(lp) =
+                                        live_project::from_parsed(&parsed, &current_path)
+                                    {
+                                        let _ = handle.emit("project-changed", &lp);
+                                        if let Ok(mut guard) = live2.lock() {
+                                            *guard = Some(lp);
+                                        }
+                                    }
+                                }
+                                WatchEvent::ProjectClosed { path, daw } => {
+                                    current_path.clear();
+                                    let _ = handle.emit(
+                                        "project-closed",
+                                        serde_json::json!({
+                                            "path": path.to_string_lossy(),
+                                            "daw": format!("{daw:?}"),
+                                        }),
+                                    );
+                                    if let Ok(mut guard) = live2.lock() {
+                                        *guard = None;
+                                    }
+                                }
+                                WatchEvent::ParseError { path, error } => {
+                                    let _ = handle.emit(
+                                        "project-error",
+                                        serde_json::json!({
+                                            "path": path.to_string_lossy(),
+                                            "error": error,
+                                        }),
+                                    );
+                                }
+                            },
+                            Err(_) => break,
+                        }
+                    }
+                });
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            scan_plugins,
+            list_plugins,
+            get_plugin_detail,
+            save_plugin_note,
+            export_library_dossier,
+            open_path,
+            save_chain,
+            list_chains,
+            get_chain,
+            delete_chain,
+            get_live_project,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+// ── HTML dossier renderer (unchanged) ─────────────────────────────────────────
 
 const DOSSIER_CSS: &str = r#"
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -275,7 +475,10 @@ fn render_dossier_html(device_id: &str, plugins: &[DossierPlugin], exported_at: 
         html.push_str("<tr>\n");
         html.push_str(&format!("<td class=\"num\">{}</td>", i + 1));
         html.push_str(&format!("<td class=\"name\">{}</td>", he(&p.name)));
-        html.push_str(&format!("<td class=\"vendor\">{}</td>", he(p.vendor.as_deref().unwrap_or("—"))));
+        html.push_str(&format!(
+            "<td class=\"vendor\">{}</td>",
+            he(p.vendor.as_deref().unwrap_or("—"))
+        ));
 
         let badges: String = p.formats.iter().map(|f| format_badge(f)).collect::<Vec<_>>().join("");
         html.push_str(&format!("<td class=\"formats\">{badges}</td>"));
@@ -284,14 +487,21 @@ fn render_dossier_html(device_id: &str, plugins: &[DossierPlugin], exported_at: 
 
         html.push_str("<td>");
         for inst in &p.instances {
-            let ver = inst.version.as_deref()
+            let ver = inst
+                .version
+                .as_deref()
                 .map(|v| format!(" <span class=\"ver\">v{}</span>", he(v)))
                 .unwrap_or_default();
             html.push_str(&format!("<div class=\"path-line\">{}{ver}</div>", he(&inst.path)));
         }
         html.push_str("</td>");
 
-        let note = p.note.as_deref().filter(|n| !n.is_empty()).map(|n| he(n)).unwrap_or_default();
+        let note = p
+            .note
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .map(|n| he(n))
+            .unwrap_or_default();
         html.push_str(&format!("<td class=\"note-cell\">{note}</td>"));
 
         html.push_str("</tr>\n");
@@ -299,26 +509,4 @@ fn render_dossier_html(device_id: &str, plugins: &[DossierPlugin], exported_at: 
 
     html.push_str("</tbody>\n</table>\n</body>\n</html>");
     html
-}
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .setup(|app| {
-            let data_dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&data_dir)?;
-            let db = Database::open(&data_dir.join("patchbay.db"))?;
-            app.manage(Mutex::new(db));
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            scan_plugins,
-            list_plugins,
-            get_plugin_detail,
-            save_plugin_note,
-            export_library_dossier,
-            open_path,
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
 }

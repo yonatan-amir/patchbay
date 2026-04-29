@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import Chains from "./views/Chains";
 import PluginDetail from "./views/PluginDetail";
 
 interface Plugin {
@@ -21,6 +22,8 @@ interface ExportResult {
   html_path: string;
 }
 
+type View = "plugins" | "chains";
+
 const FORMAT_COLORS: Record<string, string> = {
   VST3: "text-blue-400",
   AU:   "text-green-400",
@@ -29,6 +32,7 @@ const FORMAT_COLORS: Record<string, string> = {
 };
 
 export default function App() {
+  const [view, setView] = useState<View>("plugins");
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [scanning, setScanning] = useState(false);
   const [lastScan, setLastScan] = useState<ScanResult | null>(null);
@@ -44,6 +48,11 @@ export default function App() {
       .then(setPlugins)
       .catch(() => {});
   }, []);
+
+  function switchView(v: View) {
+    setView(v);
+    setSelectedPlugin(null);
+  }
 
   async function scan() {
     setScanning(true);
@@ -80,10 +89,19 @@ export default function App() {
     } catch (_) {}
   }
 
+  // Full-screen sub-views (no persistent header)
   if (selectedPlugin !== null) {
     return (
       <div className="flex flex-col h-screen bg-zinc-950 text-zinc-100 font-mono text-sm">
         <PluginDetail name={selectedPlugin} onBack={() => setSelectedPlugin(null)} />
+      </div>
+    );
+  }
+
+  if (view === "chains") {
+    return (
+      <div className="flex flex-col h-screen bg-zinc-950 text-zinc-100 font-mono text-sm">
+        <Chains onBack={() => switchView("plugins")} />
       </div>
     );
   }
@@ -106,6 +124,23 @@ export default function App() {
       {/* Header */}
       <div className="flex items-center gap-4 px-4 py-3 border-b border-zinc-800">
         <span className="font-bold tracking-tight text-base">Patchbay</span>
+
+        {/* View tabs */}
+        <div className="flex text-xs border border-zinc-700 rounded overflow-hidden">
+          {(["plugins", "chains"] as View[]).map(v => (
+            <button
+              key={v}
+              onClick={() => switchView(v)}
+              className={`px-3 py-1 capitalize transition-colors ${
+                view === v
+                  ? "bg-zinc-700 text-white"
+                  : "bg-transparent text-zinc-500 hover:text-zinc-300"
+              }`}
+            >
+              {v}
+            </button>
+          ))}
+        </div>
 
         <div className="flex gap-3 text-xs text-zinc-500">
           {Object.entries(counts).sort().map(([fmt, n]) => (
@@ -191,7 +226,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Table */}
+      {/* Plugin table */}
       <div className="flex-1 overflow-auto">
         {visible.length === 0 ? (
           <div className="flex items-center justify-center h-full text-zinc-600 text-xs">
