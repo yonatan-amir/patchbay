@@ -117,6 +117,7 @@ pub struct MacroControl {
 }
 
 /// Return type for [`read_file`].
+#[derive(Debug)]
 pub enum AbletonFile {
     Project(AbletonProject),
     Rack(AbletonRack),
