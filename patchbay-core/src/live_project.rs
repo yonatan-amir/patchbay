@@ -152,37 +152,55 @@ fn b64_encode(data: &[u8]) -> String {
     out
 }
 
+fn logic_device_to_slot(d: &logicpro::LogicDevice, pos: usize) -> LiveSlot {
+    LiveSlot {
+        position: pos as i32,
+        name: d.name.clone(),
+        vendor: Some(d.manufacturer.clone()),
+        format: Some("AU".to_string()),
+        bypass: d.bypassed,
+        wet: 1.0,
+        preset_name: None,
+        plugin_identity: json!({
+            "name": d.name,
+            "vendor": d.manufacturer,
+            "format": "AU",
+            "component_type": d.component_type,
+            "component_subtype": d.component_subtype,
+        }),
+        opaque_state: if d.state.is_empty() {
+            None
+        } else {
+            Some(b64_encode(&d.state))
+        },
+    }
+}
+
 fn from_logic_project(project: &logicpro::LogicProject, path: &str) -> LiveProject {
-    let tracks = project.tracks.iter().map(|t| {
-        let slots = t.devices.iter().enumerate().map(|(i, d)| {
-            LiveSlot {
-                position: i as i32,
-                name: d.name.clone(),
-                vendor: Some(d.manufacturer.clone()),
-                format: Some("AU".to_string()),
-                bypass: d.bypassed,
-                wet: 1.0,
-                preset_name: None,
-                plugin_identity: json!({
-                    "name": d.name,
-                    "vendor": d.manufacturer,
-                    "format": "AU",
-                    "component_type": d.component_type,
-                    "component_subtype": d.component_subtype,
-                }),
-                opaque_state: if d.state.is_empty() {
-                    None
-                } else {
-                    Some(b64_encode(&d.state))
-                },
-            }
-        }).collect();
+    let mut tracks: Vec<LiveTrack> = project.tracks.iter().map(|t| {
+        let slots = t.devices.iter().enumerate()
+            .map(|(i, d)| logic_device_to_slot(d, i))
+            .collect();
         LiveTrack {
             name: t.name.clone(),
             kind: logic_track_kind(t.kind).to_string(),
             slots,
         }
     }).collect();
+
+    // Add a synthetic "Plugin Chain" track for all third-party AUs found via
+    // UCuA block scanning (track→plugin association not yet resolved).
+    if !project.all_devices.is_empty() {
+        let slots = project.all_devices.iter().enumerate()
+            .map(|(i, d)| logic_device_to_slot(d, i))
+            .collect();
+        tracks.push(LiveTrack {
+            name: "Plugin Chain".to_string(),
+            kind: "unknown".to_string(),
+            slots,
+        });
+    }
+
     LiveProject { path: path.to_string(), daw: "Logic".to_string(), tracks }
 }
 

@@ -12,68 +12,50 @@
 //! ```
 //!
 //! Data is organised as chunks whose 4-byte tags are stored in reversed byte
-//! order (little-endian 4CC), e.g.:
+//! order (little-endian 4CC).
 //!
-//! | Bytes   | Reversed tag | Meaning          |
-//! |---------|--------------|------------------|
-//! | `karT`  | `Trak`       | Track            |
-//! | `qeSM`  | `MSeq`       | MIDI/Audio Seq.  |
-//! | `gnoS`  | `SonG`       | Song root        |
-//! | `tSnI`  | `InSt`       | Instrument/Score |
-//! | `MneG`  | `GenM`       | Generic device   |
+//! # Third-party AU plugin state — investigation results (2026-04-30)
+//! Analysis of `take me away v0.logicx` (a real production session with
+//! Omnisphere 3 and Soundtoys Little Plate) revealed the following:
 //!
-//! Each `karT` chunk contains a `qeSM` sub-chunk. The track name is a
-//! length-prefixed, null-terminated ASCII string embedded within `qeSM` at a
-//! variable offset (~52–64 bytes from the `qeSM` tag). We locate it by
-//! scanning for the first valid `len_u16LE + ascii_bytes + '\0'` triplet.
+//! ## Plugin slot marker: `UCuA`
+//! Every plugin slot (built-in or third-party) is preceded by a `UCuA` 4-byte
+//! tag. What follows determines the plugin type:
 //!
-//! # Plugin / device data — investigation results (2026-04-29)
-//! Binary analysis of `Skyline Masher.logicx` (Logic 11.2, Live Loop Grid
-//! template) revealed the following structure:
+//! - **Built-in Logic effects** (`GAME`/`GAMETSPP`): float parameter arrays,
+//!   no AU state blob. These appear immediately after `UCuA`.
+//! - **NSKeyedArchiver blobs** (`bplist00`): Smart Controls / MIDI layer
+//!   settings (`MAKeyboardLayer`, `MAPlugInParameterMapping`). Not AU state.
+//! - **Third-party AU plugins**: an inline `.aupreset`-format XML plist
+//!   (`<?xml...`) that contains the complete AU state and component identity.
 //!
-//! ## Track structure
-//! The five audio/instrument tracks begin at offset ~0x0b0dd as `karT` chunks.
-//! These are separate from ~130 `karT` chunks at the end of the file, which
-//! are MIDI device routing entries (IAC Driver, KeyStep, etc.).
-//!
-//! ## Effects channel-strip section (`GAME`/`TSPP`)
-//! Built-in Logic effects appear in a **global** section starting around
-//! 0x031c11, after a 150 KB audio-region data block. Each entry is:
-//! ```text
-//! [null_bytes][0x87 0x01 0x02 0x02]<name_str>\x00\x00
-//! GAME <flags:4B> <param_count:u32LE> ...
-//! GAMETSPP <param_count:u32LE> \x00... <param_count × f32LE params>
-//! <UUID:16B>
-//! UCuA <header> <0x1235:u32LE> <preset_name_cstr>
+//! ## Embedded `.aupreset` plist structure
+//! Each third-party AU block holds a standard Apple `.aupreset` XML plist:
+//! ```xml
+//! <dict>
+//!   <key>type</key>         <integer>1635083896</integer>  <!-- "aufx" -->
+//!   <key>subtype</key>      <integer>1280330808</integer>  <!-- "LPL8" -->
+//!   <key>manufacturer</key> <integer>1398042489</integer>  <!-- "SToy" -->
+//!   <key>data</key>         <data>...</data>               <!-- ClassInfo blob -->
+//!   <!-- vendor-specific extra keys, e.g. soundtoys-data -->
+//! </dict>
 //! ```
-//! `GAME` = "Generic Audio Module Effect"; `TSPP` = parameter table.
-//! Each UCuA sub-block contains an internal preset-path reference
-//! (`#default.pst`), **not** a raw AU state blob.
+//! The `type`/`subtype`/`manufacturer` integers are big-endian 4CC codes that
+//! uniquely identify the AU component. The `data` field is the standard AU
+//! `kAudioUnitProperty_ClassInfo` blob.
 //!
-//! The `GAME`/`TSPP` entries are NOT contained within `karT` track chunks;
-//! the association between a track and its effects channel strip cannot be
-//! determined without a format reference or test project with known mappings.
+//! ## Known AU components in the test session
+//! | Plugin          | type   | subtype | mfr  |
+//! |-----------------|--------|---------|------|
+//! | Soundtoys LP8   | `aufx` | `LPL8`  | `SToy` |
+//! | Omnisphere 3    | `aumu` | `Ambr`  | `GOSW` |
 //!
-//! ## bplist sections
-//! The 83 NSKeyedArchiver bplist blobs encode Smart Controls layout
-//! (`WsIdentity`, `WsPluginIdentity`, `MAPlugInParameterMapping`) and
-//! per-instrument MIDI layer settings (`MAKeyboardLayer`). They do NOT contain
-//! AU plugin state.
-//!
-//! ## Third-party AU plugins
-//! The test project (`Skyline Masher`) uses only Logic built-in effects.
-//! No third-party AU state blobs were observed. The format for external AUs
-//! (if embedded at all vs. referenced via library `.cst` files) is unknown.
-//!
-//! ## What is needed to unblock AU device decoding
-//! 1. A `.logicx` project containing at least one third-party AU plugin with
-//!    saved state (not a template referencing a library `.cst`).
-//! 2. Mapping from `karT` track indices to their `GAME` entries (no such
-//!    index structure has been located yet).
-//! 3. Once state blobs are found, AU component `type`/`subtype`/`manufacturer`
-//!    4CC codes must be captured — they are not present in `GAME`/`TSPP`.
-//!
-//! Devices are returned empty until the above are resolved.
+//! ## Track → plugin association
+//! Track names are stored in `karT`/`qeSM` chunks but cannot be reliably
+//! correlated to UCuA plugin blocks without a format reference. Third-party
+//! AU devices are returned in `LogicProject::all_devices` as a flat list;
+//! `tracks` still holds the available track names (kind = Unknown, devices
+//! empty). Cross-DAW chain export uses `all_devices` for now.
 //!
 //! # Fallback
 //! Older Logic 9 projects used a plain plist dictionary. The reader detects
@@ -87,8 +69,10 @@ use thiserror::Error;
 
 // ─── Magic / chunk constants ──────────────────────────────────────────────────
 
-/// First 6 bytes of every Logic Pro X `ProjectData` file.
-const LOGIC_MAGIC: &[u8] = &[0x23, 0x47, 0xc0, 0xab, 0xcf, 0x09];
+/// First 4 bytes of every Logic Pro X `ProjectData` file.
+/// Bytes 4-5 vary between Logic versions/projects (e.g. 0xcf vs 0xd0),
+/// so only the stable prefix is checked.
+const LOGIC_MAGIC: &[u8] = &[0x23, 0x47, 0xc0, 0xab];
 
 /// 4-byte reversed tag for a Track chunk (`Trak` LE).
 const TRAK: &[u8] = b"karT";
@@ -118,6 +102,10 @@ pub struct LogicProject {
     /// Logic version string, e.g. `"Logic Pro 11.2.2 (6387)"`.
     pub logic_version: String,
     pub tracks: Vec<LogicTrack>,
+    /// All third-party AU plugin instances found in the project, extracted from
+    /// embedded `.aupreset` plists. Track association is not yet resolved, so
+    /// these are returned as a flat list regardless of which track they belong to.
+    pub all_devices: Vec<LogicDevice>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -172,17 +160,20 @@ pub fn read_logicx(path: &Path) -> Result<LogicProject, LogicError> {
     let data_path = locate_project_data(path)?;
     let data = std::fs::read(&data_path)?;
 
-    let tracks = if data.starts_with(LOGIC_MAGIC) {
-        scan_proprietary_tracks(&data)
+    let (tracks, all_devices) = if data.starts_with(LOGIC_MAGIC) {
+        let t = scan_proprietary_tracks(&data);
+        let d = scan_ucua_devices(&data);
+        (t, d)
     } else {
         let root = plist::Value::from_reader(std::io::Cursor::new(&data))?;
-        extract_tracks_plist(root.as_dictionary())
+        (extract_tracks_plist(root.as_dictionary()), vec![])
     };
 
     Ok(LogicProject {
         name: project_name.unwrap_or(name),
         logic_version,
         tracks,
+        all_devices,
     })
 }
 
@@ -310,6 +301,131 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|w| w == needle)
 }
 
+// ─── Third-party AU plugin extractor (UCuA → .aupreset) ──────────────────────
+
+/// Scan the raw `ProjectData` bytes for `UCuA` blocks that contain an embedded
+/// `.aupreset`-format XML plist, extract each one as a `LogicDevice`.
+///
+/// Built-in Logic effects (followed by `GAME`) and Smart Controls NSKeyedArchiver
+/// blobs (followed by `bplist00`) are silently skipped.
+fn scan_ucua_devices(data: &[u8]) -> Vec<LogicDevice> {
+    let mut devices = Vec::new();
+    let mut search_from = 0;
+
+    loop {
+        let Some(ucua_rel) = find_subsequence(&data[search_from..], b"UCuA") else {
+            break;
+        };
+        let ucua_pos = search_from + ucua_rel;
+
+        // Look for an XML plist start within 50 KB of this UCuA.
+        let window_end = (ucua_pos + 51_200).min(data.len());
+        let Some(xml_rel) = find_subsequence(&data[ucua_pos..window_end], b"<?xml") else {
+            search_from = ucua_pos + 4;
+            continue;
+        };
+        let xml_start = ucua_pos + xml_rel;
+
+        // If GAME or bplist00 appears between UCuA and the XML, this slot is a
+        // built-in Logic effect or Smart Controls blob — skip it.
+        let inter = &data[ucua_pos..xml_start];
+        if find_subsequence(inter, b"GAME").is_some()
+            || find_subsequence(inter, b"bplist00").is_some()
+        {
+            search_from = ucua_pos + 4;
+            continue;
+        }
+
+        // Find the closing plist tag.
+        let Some(end_rel) = find_subsequence(&data[xml_start..], b"</plist>") else {
+            search_from = ucua_pos + 4;
+            continue;
+        };
+        let plist_end = xml_start + end_rel + 8;
+        let plist_bytes = &data[xml_start..plist_end];
+        let pre_xml = &data[ucua_pos..xml_start];
+
+        if let Some(device) = parse_aupreset_plist(plist_bytes, pre_xml) {
+            devices.push(device);
+        }
+
+        search_from = plist_end;
+    }
+
+    devices
+}
+
+/// Parse an embedded `.aupreset` XML plist and return a `LogicDevice`.
+fn parse_aupreset_plist(bytes: &[u8], pre_xml: &[u8]) -> Option<LogicDevice> {
+    let cursor = std::io::Cursor::new(bytes);
+    let value = plist::Value::from_reader(cursor).ok()?;
+    let dict = value.as_dictionary()?;
+
+    let type_i = dict.get("type")?.as_signed_integer()?;
+    let subtype_i = dict.get("subtype")?.as_signed_integer()?;
+    let mfr_i = dict.get("manufacturer")?.as_signed_integer()?;
+
+    let component_type = four_cc(type_i);
+    let component_subtype = four_cc(subtype_i);
+    let manufacturer_cc = four_cc(mfr_i);
+
+    // Derive a human-readable name: Soundtoys stores "WIDGET = <name>" in a
+    // vendor-specific key; for all others we try the binary context.
+    let name = soundtoys_widget_name(dict)
+        .or_else(|| extract_plugin_name(pre_xml))
+        .filter(|n| !n.is_empty() && n != "Untitled")
+        .unwrap_or_else(|| component_subtype.clone());
+
+    // The full plist bytes IS the standard .aupreset payload — store verbatim.
+    let state = bytes.to_vec();
+
+    Some(LogicDevice {
+        name,
+        manufacturer: manufacturer_cc,
+        component_type,
+        component_subtype,
+        bypassed: false,
+        state,
+    })
+}
+
+/// Extract the plugin name from Soundtoys' `soundtoys-data` string.
+/// Format: `"WIDGET = Little Plate;VERSION = 4;..."`
+fn soundtoys_widget_name(dict: &plist::Dictionary) -> Option<String> {
+    let data = dict.get("soundtoys-data")?.as_string()?;
+    data.split(';')
+        .find(|part| part.trim_start().starts_with("WIDGET"))
+        .and_then(|part| part.splitn(2, '=').nth(1))
+        .map(|v| v.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Scan the bytes between a `UCuA` marker and an XML plist for the plugin name.
+///
+/// Logic stores the plugin name as a printable ASCII string a few bytes before
+/// the 12-character base64-encoded AU component identifier. We collect all
+/// printable runs, drop the component ID (12-char all-alphanumeric), and return
+/// the last remaining candidate.
+fn extract_plugin_name(pre_xml: &[u8]) -> Option<String> {
+    const SKIP_FRAGMENTS: &[&str] = &["Untitled", "aupreset", "#Custom", "#default", "46ia"];
+
+    // Collect all runs of printable ASCII (0x20–0x7e), length >= 4.
+    let text: String = pre_xml
+        .iter()
+        .map(|&b| if (0x20..=0x7e).contains(&b) { b as char } else { '\x00' })
+        .collect();
+
+    text.split('\x00')
+        .map(str::trim)
+        .filter(|s| s.len() >= 4)
+        .filter(|s| s.chars().any(|c| c.is_alphabetic()))
+        .filter(|s| !SKIP_FRAGMENTS.iter().any(|skip| s.contains(skip)))
+        // Drop 12-char all-alphanumeric strings — those are base64-encoded component IDs.
+        .filter(|s| !(s.len() == 12 && s.chars().all(|c| c.is_ascii_alphanumeric())))
+        .last()
+        .map(str::to_string)
+}
+
 // ─── Legacy plist format fallback ─────────────────────────────────────────────
 
 fn extract_tracks_plist(dict: Option<&Dictionary>) -> Vec<LogicTrack> {
@@ -434,9 +550,15 @@ mod tests {
 
     #[test]
     fn magic_detection() {
-        let mut data = LOGIC_MAGIC.to_vec();
-        data.extend_from_slice(&[0u8; 100]);
-        assert!(data.starts_with(LOGIC_MAGIC));
+        // Verify both known byte-4 variants are detected by the 4-byte prefix.
+        let mut data_cf = LOGIC_MAGIC.to_vec();
+        data_cf.extend_from_slice(&[0xcf, 0x09, 0x03, 0x00]);
+        assert!(data_cf.starts_with(LOGIC_MAGIC));
+
+        let mut data_d0 = LOGIC_MAGIC.to_vec();
+        data_d0.extend_from_slice(&[0xd0, 0x09, 0x03, 0x00]);
+        assert!(data_d0.starts_with(LOGIC_MAGIC));
+
         assert!(!b"bplist00".starts_with(LOGIC_MAGIC));
     }
 
@@ -538,6 +660,45 @@ mod tests {
             .iter()
             .any(|t| t.name.len() >= 2 && t.name != "Untitled");
         assert!(has_real_name, "at least one track should have a real name");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn integration_real_session_third_party_au() {
+        let path = std::path::Path::new(
+            "/Users/jonathanamir/projects/take me away/take me away v0.logicx",
+        );
+        if !path.exists() {
+            eprintln!("integration test skipped: project not found");
+            return;
+        }
+
+        let project = read_logicx(path).expect("must not error on real session");
+        eprintln!("take me away — version: {}, tracks: {}, devices: {}",
+            project.logic_version, project.tracks.len(), project.all_devices.len());
+
+        assert!(
+            !project.all_devices.is_empty(),
+            "real session should have third-party AU devices"
+        );
+
+        for d in &project.all_devices {
+            eprintln!(
+                "  device: {:?} type={} sub={} mfr={} state={}B",
+                d.name, d.component_type, d.component_subtype, d.manufacturer, d.state.len()
+            );
+            assert!(!d.component_type.is_empty());
+            assert!(!d.component_subtype.is_empty());
+            assert!(!d.state.is_empty(), "device {:?} has empty state", d.name);
+        }
+
+        // Expect at least Soundtoys Little Plate and Omnisphere
+        let has_soundtoys = project.all_devices.iter()
+            .any(|d| d.manufacturer == "SToy");
+        let has_omnisphere = project.all_devices.iter()
+            .any(|d| d.component_subtype == "Ambr");
+        assert!(has_soundtoys, "expected Soundtoys device");
+        assert!(has_omnisphere, "expected Omnisphere device");
     }
 
     #[test]
