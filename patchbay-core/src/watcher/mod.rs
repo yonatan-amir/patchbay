@@ -461,6 +461,11 @@ fn register_project(
         path: path.clone(),
         daw: entry.kind,
     });
+    // Parse immediately so the frontend sees the current state without waiting
+    // for a file-change event (which never fires if nothing changes after launch).
+    if let Ok(parsed) = parse_project(&path, entry.kind) {
+        let _ = events_tx.send(WatchEvent::ProjectChanged { parsed });
+    }
     active.insert(
         pid,
         ActiveProject {
