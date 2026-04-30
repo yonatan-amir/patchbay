@@ -272,6 +272,18 @@ fn list_chains(db: tauri::State<'_, Mutex<Database>>) -> Result<Vec<ChainRow>, S
     db.list_chains(&did).map_err(|e| e.to_string())
 }
 
+/// List chains on this device that contain a slot with the given plugin name.
+#[tauri::command]
+fn list_chains_for_plugin(
+    db: tauri::State<'_, Mutex<Database>>,
+    plugin_name: String,
+) -> Result<Vec<ChainRow>, String> {
+    let did = device_id();
+    let db = db.lock().map_err(|e| e.to_string())?;
+    db.list_chains_for_plugin(&plugin_name, &did)
+        .map_err(|e| e.to_string())
+}
+
 /// Return full detail for a chain including all slots.
 #[tauri::command]
 fn get_chain(
@@ -450,6 +462,7 @@ pub fn run() {
             open_path,
             save_chain,
             list_chains,
+            list_chains_for_plugin,
             get_chain,
             delete_chain,
             export_chain,

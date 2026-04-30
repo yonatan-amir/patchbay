@@ -458,6 +458,36 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn list_chains_for_plugin(
+        &self,
+        plugin_name: &str,
+        device_id: &str,
+    ) -> Result<Vec<ChainRow>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT c.id, c.sync_id, c.name, c.daw, c.tags, c.source_track, c.created_at
+             FROM chains c
+             JOIN chain_slots s ON s.chain_id = c.id
+             WHERE c.device_id = ?1
+               AND json_extract(s.plugin_identity, '$.name') = ?2
+             ORDER BY c.created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![device_id, plugin_name], |row| {
+                Ok(ChainRow {
+                    id: row.get(0)?,
+                    sync_id: row.get(1)?,
+                    name: row.get(2)?,
+                    daw: row.get(3)?,
+                    tags: row.get(4)?,
+                    source_track: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     pub fn get_chain(&self, chain_id: i64) -> Result<Option<ChainDetail>, DbError> {
         let chain = self.conn.query_row(
             "SELECT id, sync_id, name, daw, source_track, notes, tags, created_at

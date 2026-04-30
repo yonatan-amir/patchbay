@@ -1,145 +1,130 @@
-import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import Chains from "./views/Chains";
-import PluginDetail from "./views/PluginDetail";
-
-interface Plugin {
-  name: string;
-  vendor: string | null;
-  format: string;
-  category: string | null;
-}
+import { useState, useEffect } from "react"
+import { invoke } from "@tauri-apps/api/core"
+import Chains from "./views/Chains"
+import { PluginFilters, type Filters, type Plugin } from "./components/PluginFilters"
+import { PluginList } from "./components/PluginList"
+import { CenterPanel } from "./components/CenterPanel"
+import { RightPanel } from "./components/RightPanel"
 
 interface ScanResult {
-  plugins_found: number;
-  plugins_skipped: number;
-  errors: string[];
+  plugins_found: number
+  plugins_skipped: number
+  errors: string[]
 }
 
 interface ExportResult {
-  plugin_count: number;
-  json_path: string;
-  html_path: string;
+  plugin_count: number
+  json_path: string
+  html_path: string
 }
-
-type View = "plugins" | "chains";
 
 const FORMAT_COLORS: Record<string, string> = {
   VST3: "text-blue-400",
-  AU:   "text-green-400",
+  AU: "text-green-400",
   VST2: "text-yellow-400",
   CLAP: "text-purple-400",
-};
+}
+
+type Mode = "browser" | "live"
 
 export default function App() {
-  const [view, setView] = useState<View>("plugins");
-  const [plugins, setPlugins] = useState<Plugin[]>([]);
-  const [scanning, setScanning] = useState(false);
-  const [lastScan, setLastScan] = useState<ScanResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState("");
-  const [selectedPlugin, setSelectedPlugin] = useState<string | null>(null);
-  const [exporting, setExporting] = useState(false);
-  const [exportResult, setExportResult] = useState<ExportResult | null>(null);
-  const [exportError, setExportError] = useState<string | null>(null);
+  const [mode, setMode] = useState<Mode>("browser")
+  const [plugins, setPlugins] = useState<Plugin[]>([])
+  const [scanning, setScanning] = useState(false)
+  const [lastScan, setLastScan] = useState<ScanResult | null>(null)
+  const [scanError, setScanError] = useState<string | null>(null)
+  const [exporting, setExporting] = useState(false)
+  const [exportResult, setExportResult] = useState<ExportResult | null>(null)
+  const [exportError, setExportError] = useState<string | null>(null)
+
+  const [filters, setFilters] = useState<Filters>({
+    search: "",
+    format: null,
+    vendor: null,
+    category: null,
+  })
+  const [selectedPlugin, setSelectedPlugin] = useState<Plugin | null>(null)
+  const [selectedChainId, setSelectedChainId] = useState<number | null>(null)
 
   useEffect(() => {
-    invoke<Plugin[]>("list_plugins")
-      .then(setPlugins)
-      .catch(() => {});
-  }, []);
-
-  function switchView(v: View) {
-    setView(v);
-    setSelectedPlugin(null);
-  }
+    invoke<Plugin[]>("list_plugins").then(setPlugins).catch(() => {})
+  }, [])
 
   async function scan() {
-    setScanning(true);
-    setError(null);
+    setScanning(true)
+    setScanError(null)
     try {
-      const result = await invoke<ScanResult>("scan_plugins");
-      setLastScan(result);
-      const updated = await invoke<Plugin[]>("list_plugins");
-      setPlugins(updated);
+      const result = await invoke<ScanResult>("scan_plugins")
+      setLastScan(result)
+      const updated = await invoke<Plugin[]>("list_plugins")
+      setPlugins(updated)
     } catch (e) {
-      setError(String(e));
+      setScanError(String(e))
     } finally {
-      setScanning(false);
+      setScanning(false)
     }
   }
 
   async function exportDossier() {
-    setExporting(true);
-    setExportError(null);
-    setExportResult(null);
+    setExporting(true)
+    setExportError(null)
+    setExportResult(null)
     try {
-      const result = await invoke<ExportResult>("export_library_dossier");
-      setExportResult(result);
+      const result = await invoke<ExportResult>("export_library_dossier")
+      setExportResult(result)
     } catch (e) {
-      setExportError(String(e));
+      setExportError(String(e))
     } finally {
-      setExporting(false);
+      setExporting(false)
     }
   }
 
-  async function openPath(path: string) {
-    try {
-      await invoke("open_path", { path });
-    } catch (_) {}
+  function openPath(path: string) {
+    invoke("open_path", { path }).catch(() => {})
   }
 
-  // Full-screen sub-views (no persistent header)
-  if (selectedPlugin !== null) {
-    return (
-      <div className="flex flex-col h-screen bg-zinc-950 text-zinc-100 font-mono text-sm">
-        <PluginDetail name={selectedPlugin} onBack={() => setSelectedPlugin(null)} />
-      </div>
-    );
+  function handleSelectPlugin(p: Plugin) {
+    setSelectedPlugin(p)
+    setSelectedChainId(null)
   }
 
-  if (view === "chains") {
-    return (
-      <div className="flex flex-col h-screen bg-zinc-950 text-zinc-100 font-mono text-sm">
-        <Chains onBack={() => switchView("plugins")} />
-      </div>
-    );
+  function handleDeleteChain(id: number) {
+    if (selectedChainId === id) setSelectedChainId(null)
   }
 
-  const visible = filter
-    ? plugins.filter(p =>
-        p.name.toLowerCase().includes(filter.toLowerCase()) ||
-        (p.vendor ?? "").toLowerCase().includes(filter.toLowerCase()) ||
-        p.format.toLowerCase().includes(filter.toLowerCase())
-      )
-    : plugins;
+  function patchFilters(patch: Partial<Filters>) {
+    setFilters(prev => ({ ...prev, ...patch }))
+  }
 
   const counts = plugins.reduce<Record<string, number>>((acc, p) => {
-    acc[p.format] = (acc[p.format] ?? 0) + 1;
-    return acc;
-  }, {});
+    acc[p.format] = (acc[p.format] ?? 0) + 1
+    return acc
+  }, {})
+
+  if (mode === "live") {
+    return (
+      <div className="flex flex-col h-screen bg-zinc-950 text-zinc-100 font-mono text-sm">
+        <Chains onBack={() => setMode("browser")} />
+      </div>
+    )
+  }
 
   return (
     <div className="flex flex-col h-screen bg-zinc-950 text-zinc-100 font-mono text-sm">
       {/* Header */}
-      <div className="flex items-center gap-4 px-4 py-3 border-b border-zinc-800">
-        <span className="font-bold tracking-tight text-base">Patchbay</span>
+      <div className="flex items-center gap-4 px-4 py-2.5 border-b border-zinc-800 shrink-0">
+        <span className="font-bold tracking-tight text-sm">Patchbay</span>
 
-        {/* View tabs */}
         <div className="flex text-xs border border-zinc-700 rounded overflow-hidden">
-          {(["plugins", "chains"] as View[]).map(v => (
-            <button
-              key={v}
-              onClick={() => switchView(v)}
-              className={`px-3 py-1 capitalize transition-colors ${
-                view === v
-                  ? "bg-zinc-700 text-white"
-                  : "bg-transparent text-zinc-500 hover:text-zinc-300"
-              }`}
-            >
-              {v}
-            </button>
-          ))}
+          <button className="px-3 py-1 bg-zinc-700 text-white cursor-default">
+            Browser
+          </button>
+          <button
+            onClick={() => setMode("live")}
+            className="px-3 py-1 text-zinc-500 hover:text-zinc-300 transition-colors"
+          >
+            Live
+          </button>
         </div>
 
         <div className="flex gap-3 text-xs text-zinc-500">
@@ -150,7 +135,7 @@ export default function App() {
             </span>
           ))}
           {plugins.length > 0 && (
-            <span className="text-zinc-600">total {plugins.length}</span>
+            <span className="text-zinc-700">total {plugins.length}</span>
           )}
         </div>
 
@@ -162,20 +147,12 @@ export default function App() {
           </span>
         )}
 
-        <input
-          type="text"
-          placeholder="filter..."
-          value={filter}
-          onChange={e => setFilter(e.target.value)}
-          className="bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs w-40 focus:outline-none focus:border-zinc-500"
-        />
-
         <button
           onClick={exportDossier}
           disabled={exporting || plugins.length === 0}
           className="bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 border border-zinc-700 rounded px-3 py-1 text-xs transition-colors"
         >
-          {exporting ? "Exporting…" : "Export Dossier"}
+          {exporting ? "Exporting…" : "Export"}
         </button>
 
         <button
@@ -187,29 +164,23 @@ export default function App() {
         </button>
       </div>
 
-      {/* Error */}
-      {error && (
-        <div className="px-4 py-2 text-red-400 text-xs border-b border-zinc-800">
-          {error}
+      {/* Status bars */}
+      {scanError && (
+        <div className="px-4 py-2 text-red-400 text-xs border-b border-zinc-800 shrink-0 flex items-center gap-3">
+          <span>{scanError}</span>
+          <button onClick={() => setScanError(null)} className="text-zinc-600 hover:text-zinc-400 ml-auto">✕</button>
         </div>
       )}
-
-      {/* Export error */}
       {exportError && (
-        <div className="flex items-center gap-3 px-4 py-2 text-red-400 text-xs border-b border-zinc-800">
+        <div className="flex items-center gap-3 px-4 py-2 text-red-400 text-xs border-b border-zinc-800 shrink-0">
           <span>Export failed: {exportError}</span>
-          <button onClick={() => setExportError(null)} className="text-zinc-600 hover:text-zinc-400">✕</button>
+          <button onClick={() => setExportError(null)} className="text-zinc-600 hover:text-zinc-400 ml-auto">✕</button>
         </div>
       )}
-
-      {/* Export success banner */}
       {exportResult && (
-        <div className="flex items-center gap-3 px-4 py-2 text-xs border-b border-zinc-800 bg-zinc-900/60">
+        <div className="flex items-center gap-3 px-4 py-2 text-xs border-b border-zinc-800 bg-zinc-900/60 shrink-0">
           <span className="text-green-400">✓</span>
-          <span className="text-zinc-400">
-            Exported {exportResult.plugin_count} plugins to{" "}
-            <span className="text-zinc-300 font-medium">{exportResult.html_path}</span>
-          </span>
+          <span className="text-zinc-400">Exported {exportResult.plugin_count} plugins</span>
           <button
             onClick={() => openPath(exportResult.html_path)}
             className="text-blue-400 hover:text-blue-300 underline"
@@ -226,45 +197,39 @@ export default function App() {
         </div>
       )}
 
-      {/* Plugin table */}
-      <div className="flex-1 overflow-auto">
-        {visible.length === 0 ? (
-          <div className="flex items-center justify-center h-full text-zinc-600 text-xs">
-            {plugins.length === 0 ? "Hit Scan to index your plugins" : "No matches"}
-          </div>
-        ) : (
-          <table className="w-full border-collapse">
-            <thead className="sticky top-0 bg-zinc-950 border-b border-zinc-800">
-              <tr className="text-zinc-500 text-xs">
-                <th className="text-left px-4 py-2 font-normal w-8">#</th>
-                <th className="text-left px-4 py-2 font-normal">Name</th>
-                <th className="text-left px-4 py-2 font-normal">Vendor</th>
-                <th className="text-left px-4 py-2 font-normal w-16">Format</th>
-                <th className="text-left px-4 py-2 font-normal">Category</th>
-              </tr>
-            </thead>
-            <tbody>
-              {visible.map((p, i) => (
-                <tr
-                  key={i}
-                  onClick={() => setSelectedPlugin(p.name)}
-                  className="border-b border-zinc-900 hover:bg-zinc-900/50 cursor-pointer"
-                >
-                  <td className="px-4 py-1.5 text-zinc-600">{i + 1}</td>
-                  <td className="px-4 py-1.5">{p.name}</td>
-                  <td className="px-4 py-1.5 text-zinc-400">{p.vendor ?? ""}</td>
-                  <td className="px-4 py-1.5">
-                    <span className={FORMAT_COLORS[p.format] ?? "text-zinc-400"}>
-                      {p.format}
-                    </span>
-                  </td>
-                  <td className="px-4 py-1.5 text-zinc-500">{p.category ?? ""}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+      {/* 3-panel body */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Left: Plugin list */}
+        <div className="w-72 min-w-[200px] border-r border-zinc-800 flex flex-col overflow-hidden">
+          <PluginFilters plugins={plugins} filters={filters} onChange={patchFilters} />
+          {plugins.length === 0 ? (
+            <div className="flex items-center justify-center flex-1 text-zinc-600 text-xs text-center px-6 leading-relaxed">
+              Hit Scan to index your plugins
+            </div>
+          ) : (
+            <PluginList
+              plugins={plugins}
+              filters={filters}
+              selectedPlugin={selectedPlugin}
+              onSelect={handleSelectPlugin}
+            />
+          )}
+        </div>
+
+        {/* Center: Chains + presets for selected plugin */}
+        <div className="flex-1 border-r border-zinc-800 flex flex-col overflow-hidden min-w-0">
+          <CenterPanel
+            selectedPlugin={selectedPlugin}
+            selectedChainId={selectedChainId}
+            onSelectChain={setSelectedChainId}
+          />
+        </div>
+
+        {/* Right: Chain / preset detail */}
+        <div className="w-80 min-w-[240px] flex flex-col overflow-hidden border-l border-zinc-800">
+          <RightPanel chainId={selectedChainId} onDeleteChain={handleDeleteChain} />
+        </div>
       </div>
     </div>
-  );
+  )
 }
