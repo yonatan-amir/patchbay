@@ -246,7 +246,7 @@ fn find_via_lsof(pid: u32, extensions: &[&str]) -> Option<PathBuf> {
     let mut best: Option<PathBuf> = None;
 
     for line in stdout.lines() {
-        let path_str = line.strip_prefix('n')?;
+        let Some(path_str) = line.strip_prefix('n') else { continue };
         let p = PathBuf::from(path_str);
 
         // Direct extension match (e.g. .als, .rpp).
