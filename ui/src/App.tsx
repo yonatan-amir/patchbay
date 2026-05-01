@@ -1,10 +1,11 @@
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { invoke } from "@tauri-apps/api/core"
 import Chains from "./views/Chains"
 import { PluginFilters, type Filters, type Plugin } from "./components/PluginFilters"
 import { PluginList } from "./components/PluginList"
 import { CenterPanel } from "./components/CenterPanel"
 import { RightPanel } from "./components/RightPanel"
+import { SearchResults, type SearchHit } from "./components/SearchResults"
 
 interface ScanResult {
   plugins_found: number
@@ -46,8 +47,36 @@ export default function App() {
   const [selectedPlugin, setSelectedPlugin] = useState<Plugin | null>(null)
   const [selectedChainId, setSelectedChainId] = useState<number | null>(null)
 
+  const [searchQuery, setSearchQuery] = useState("")
+  const [searchHits, setSearchHits] = useState<SearchHit[]>([])
+  const [searchOpen, setSearchOpen] = useState(false)
+  const searchRef = useRef<HTMLDivElement>(null)
+
   useEffect(() => {
     invoke<Plugin[]>("list_plugins").then(setPlugins).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      setSearchHits([])
+      return
+    }
+    const timer = setTimeout(() => {
+      invoke<SearchHit[]>("search_library", { query: searchQuery })
+        .then(setSearchHits)
+        .catch(() => setSearchHits([]))
+    }, 200)
+    return () => clearTimeout(timer)
+  }, [searchQuery])
+
+  useEffect(() => {
+    function onPointerDown(e: PointerEvent) {
+      if (searchRef.current && !searchRef.current.contains(e.target as Node)) {
+        setSearchOpen(false)
+      }
+    }
+    document.addEventListener("pointerdown", onPointerDown)
+    return () => document.removeEventListener("pointerdown", onPointerDown)
   }, [])
 
   async function scan() {
@@ -86,6 +115,20 @@ export default function App() {
   function handleSelectPlugin(p: Plugin) {
     setSelectedPlugin(p)
     setSelectedChainId(null)
+  }
+
+  function handleSearchSelectPlugin(name: string) {
+    const match = plugins.find(p => p.name === name) ?? null
+    setSelectedPlugin(match)
+    setSelectedChainId(null)
+    setSearchQuery("")
+    setSearchOpen(false)
+  }
+
+  function handleSearchSelectChain(id: number) {
+    setSelectedChainId(id)
+    setSearchQuery("")
+    setSearchOpen(false)
   }
 
   function handleDeleteChain(id: number) {
@@ -139,7 +182,28 @@ export default function App() {
           )}
         </div>
 
-        <div className="flex-1" />
+        {/* Global search */}
+        <div ref={searchRef} className="flex-1 max-w-sm relative">
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={e => { setSearchQuery(e.target.value); setSearchOpen(true) }}
+            onFocus={() => setSearchOpen(true)}
+            onKeyDown={e => { if (e.key === "Escape") { setSearchQuery(""); setSearchOpen(false) } }}
+            placeholder="Search plugins, chains, presets…"
+            className="w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-1 text-xs placeholder-zinc-600 focus:outline-none focus:border-zinc-500"
+          />
+          {searchOpen && (searchQuery.trim().length > 0) && (
+            <div className="absolute top-full left-0 right-0 mt-1 z-50 bg-zinc-900 border border-zinc-700 rounded shadow-xl overflow-y-auto max-h-80">
+              <SearchResults
+                hits={searchHits}
+                onSelectPlugin={handleSearchSelectPlugin}
+                onSelectChain={handleSearchSelectChain}
+                onClose={() => { setSearchQuery(""); setSearchOpen(false) }}
+              />
+            </div>
+          )}
+        </div>
 
         {lastScan && (
           <span className="text-xs text-zinc-600">

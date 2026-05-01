@@ -69,6 +69,16 @@ pub struct DossierPlugin {
     pub first_seen: String,
 }
 
+// ── Search types ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct SearchHit {
+    pub result_type: String,
+    pub id: i64,
+    pub name: String,
+    pub subtitle: String,
+}
+
 // ── Chain types ─────────────────────────────────────────────────────────────
 
 pub struct ChainRecord {
@@ -125,6 +135,13 @@ pub struct ChainDetail {
     pub tags: Option<String>,
     pub created_at: String,
     pub slots: Vec<ChainSlotRow>,
+}
+
+fn build_fts5_query(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|tok| format!("\"{}\"*", tok.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl Database {
@@ -541,6 +558,117 @@ impl Database {
     pub fn delete_chain(&self, chain_id: i64) -> Result<(), DbError> {
         self.conn.execute("DELETE FROM chains WHERE id = ?1", [chain_id])?;
         Ok(())
+    }
+
+    /// Full-text search across plugins, chains, presets (FTS5), and plugin notes.
+    /// Results are ordered: plugins first, then chains, presets, notes.
+    /// Each group is capped at 20 hits. Empty query returns nothing.
+    pub fn global_search(&self, query: &str, device_id: &str) -> Result<Vec<SearchHit>, DbError> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        let like_q = format!("%{}%", query.replace('%', r"\%").replace('_', r"\_"));
+        let mut hits: Vec<SearchHit> = Vec::new();
+
+        // Plugins — deduplicate by name, match on name or vendor
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT MIN(id), name, COALESCE(MIN(vendor), '')
+                 FROM plugins
+                 WHERE device_id = ?1
+                   AND (name LIKE ?2 ESCAPE '\\' OR vendor LIKE ?2 ESCAPE '\\')
+                 GROUP BY name
+                 ORDER BY name COLLATE NOCASE
+                 LIMIT 20",
+            )?;
+            hits.extend(
+                stmt.query_map(rusqlite::params![device_id, &like_q], |row| {
+                    Ok(SearchHit {
+                        result_type: "plugin".to_string(),
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        subtitle: row.get(2)?,
+                    })
+                })?
+                .filter_map(|r| r.ok()),
+            );
+        }
+
+        // Chains — match on name, tags, notes, or source_track
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, name, COALESCE(daw, '')
+                 FROM chains
+                 WHERE device_id = ?1
+                   AND (name         LIKE ?2 ESCAPE '\\'
+                        OR tags       LIKE ?2 ESCAPE '\\'
+                        OR notes      LIKE ?2 ESCAPE '\\'
+                        OR source_track LIKE ?2 ESCAPE '\\')
+                 ORDER BY updated_at DESC
+                 LIMIT 20",
+            )?;
+            hits.extend(
+                stmt.query_map(rusqlite::params![device_id, &like_q], |row| {
+                    Ok(SearchHit {
+                        result_type: "chain".to_string(),
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        subtitle: row.get(2)?,
+                    })
+                })?
+                .filter_map(|r| r.ok()),
+            );
+        }
+
+        // Presets — FTS5 prefix match on name, tags, plugin_name, vendor
+        {
+            let fts_q = build_fts5_query(query);
+            let mut stmt = self.conn.prepare(
+                "SELECT p.id, p.name, f.plugin_name
+                 FROM presets_fts f
+                 JOIN presets p ON p.id = f.rowid
+                 JOIN plugins pl ON pl.id = p.plugin_id AND pl.device_id = ?1
+                 WHERE f MATCH ?2
+                 LIMIT 20",
+            )?;
+            hits.extend(
+                stmt.query_map(rusqlite::params![device_id, &fts_q], |row| {
+                    Ok(SearchHit {
+                        result_type: "preset".to_string(),
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        subtitle: row.get(2)?,
+                    })
+                })?
+                .filter_map(|r| r.ok()),
+            );
+        }
+
+        // Plugin notes — match note body, surface as the owning plugin
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT pl.id, pl.name, COALESCE(pl.vendor, '')
+                 FROM plugin_notes pn
+                 JOIN plugins pl ON pl.id = pn.plugin_id AND pl.device_id = ?1
+                 WHERE pn.body LIKE ?2 ESCAPE '\\'
+                 GROUP BY pl.name
+                 LIMIT 10",
+            )?;
+            hits.extend(
+                stmt.query_map(rusqlite::params![device_id, &like_q], |row| {
+                    Ok(SearchHit {
+                        result_type: "note".to_string(),
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        subtitle: row.get(2)?,
+                    })
+                })?
+                .filter_map(|r| r.ok()),
+            );
+        }
+
+        Ok(hits)
     }
 
     fn run_migrations(&self) -> Result<(), DbError> {

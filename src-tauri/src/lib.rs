@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use patchbay_core::daw_writers::{ableton, dawproject, logicpro, reaper};
 use patchbay_core::db::{
-    ChainDetail, ChainRecord, ChainRow, ChainSlotRecord, Database, DossierPlugin,
+    ChainDetail, ChainRecord, ChainRow, ChainSlotRecord, Database, DossierPlugin, SearchHit,
 };
 use patchbay_core::live_project::LiveProject;
 
@@ -364,6 +364,18 @@ fn export_chain(
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Search plugins (name, vendor), chains (name, tags, notes), presets (FTS5),
+/// and plugin notes. Results are grouped by type in the order returned.
+#[tauri::command]
+fn search_library(
+    query: String,
+    state: tauri::State<'_, Mutex<Database>>,
+) -> Result<Vec<SearchHit>, String> {
+    let did = device_id();
+    let db = state.lock().map_err(|e| e.to_string())?;
+    db.global_search(&query, &did).map_err(|e| e.to_string())
+}
+
 /// Return the live project currently open in a DAW, if any.
 #[tauri::command]
 fn get_live_project(
@@ -467,6 +479,7 @@ pub fn run() {
             delete_chain,
             export_chain,
             get_live_project,
+            search_library,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
