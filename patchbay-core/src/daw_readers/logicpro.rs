@@ -51,11 +51,13 @@
 //! | Omnisphere 3    | `aumu` | `Ambr`  | `GOSW` |
 //!
 //! ## Track → plugin association
-//! Track names are stored in `karT`/`qeSM` chunks but cannot be reliably
-//! correlated to UCuA plugin blocks without a format reference. Third-party
-//! AU devices are returned in `LogicProject::all_devices` as a flat list;
-//! `tracks` still holds the available track names (kind = Unknown, devices
-//! empty). Cross-DAW chain export uses `all_devices` for now.
+//! `karT`/`qeSM` chunks give track names; `UCuA` chunks give plugin slots.
+//! The reader correlates them by file position: each `UCuA` is assigned to
+//! the nearest preceding `karT`. Tracks with no plugins are discarded before
+//! returning. This is a positional heuristic — not a spec-level guarantee —
+//! but it produces the correct result for standard sequential project layouts.
+//! Plugins that appear before the first `karT` (rare) fall back to
+//! `LogicProject::all_devices`.
 //!
 //! # Fallback
 //! Older Logic 9 projects used a plain plist dictionary. The reader detects
@@ -128,7 +130,7 @@ pub enum TrackKind {
     Unknown,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogicDevice {
     pub name: String,
     pub manufacturer: String,
@@ -161,9 +163,9 @@ pub fn read_logicx(path: &Path) -> Result<LogicProject, LogicError> {
     let data = std::fs::read(&data_path)?;
 
     let (tracks, all_devices) = if data.starts_with(LOGIC_MAGIC) {
-        let t = scan_proprietary_tracks(&data);
-        let d = scan_ucua_devices(&data);
-        (t, d)
+        let traks = collect_trak_entries(&data);
+        let ucuas = collect_ucua_entries(&data);
+        associate_plugins_to_tracks(traks, ucuas)
     } else {
         let root = plist::Value::from_reader(std::io::Cursor::new(&data))?;
         (extract_tracks_plist(root.as_dictionary()), vec![])
@@ -225,38 +227,152 @@ fn parse_project_info(plist_path: &Path) -> (Option<String>, String) {
 
 // ─── Proprietary binary format parser ────────────────────────────────────────
 
-/// Scan the raw `ProjectData` bytes for `karT` chunks and extract track names
-/// from their embedded `qeSM` sub-chunks.
-///
-/// Track kind and AU device chain are not yet decoded (Phase 1 limitation).
-fn scan_proprietary_tracks(data: &[u8]) -> Vec<LogicTrack> {
-    let mut tracks = Vec::new();
+struct TrakEntry {
+    pos: usize,
+    name: String,
+}
+
+enum UcuaKind {
+    ThirdParty(LogicDevice),
+    BuiltIn(String),
+}
+
+struct UcuaEntry {
+    pos: usize,
+    kind: UcuaKind,
+}
+
+/// Collect all `karT` chunk positions and their track names from `qeSM` sub-chunks.
+fn collect_trak_entries(data: &[u8]) -> Vec<TrakEntry> {
+    let mut entries = Vec::new();
     let mut pos = 0;
 
     while pos + 4 <= data.len() {
         if data[pos..].starts_with(TRAK) {
             let window_end = (pos + 512).min(data.len());
-            let window = &data[pos..window_end];
-
-            if let Some(qesm_rel) = find_subsequence(window, QESM) {
+            if let Some(qesm_rel) = find_subsequence(&data[pos..window_end], QESM) {
                 let qesm_abs = pos + qesm_rel;
                 if let Some(name) = extract_name_from_qesm(data, qesm_abs) {
-                    tracks.push(LogicTrack {
-                        name,
-                        kind: TrackKind::Unknown,
-                        devices: vec![],
-                    });
+                    entries.push(TrakEntry { pos, name });
                 }
             }
-
-            // Skip to the next potential track — minimum chunk size is ~50 bytes.
             pos += 50;
         } else {
             pos += 1;
         }
     }
 
-    tracks
+    entries
+}
+
+/// Collect all `UCuA` plugin slot positions, capturing both built-in Logic
+/// effects (`GAME` tag) and third-party AU plugins (embedded XML plist).
+/// Smart Controls blobs (`bplist00`) are skipped — they are not plugin slots.
+fn collect_ucua_entries(data: &[u8]) -> Vec<UcuaEntry> {
+    let mut entries = Vec::new();
+    let mut search_from = 0;
+
+    loop {
+        let Some(rel) = find_subsequence(&data[search_from..], b"UCuA") else { break };
+        let ucua_pos = search_from + rel;
+        let window_end = (ucua_pos + 51_200).min(data.len());
+        let window = &data[ucua_pos..window_end];
+
+        let game_pos    = find_subsequence(window, b"GAME");
+        let bplist_pos  = find_subsequence(window, b"bplist00");
+        let xml_pos     = find_subsequence(window, b"<?xml");
+
+        // Determine which signal appears first in the file.
+        let first: Option<(&str, usize)> = [
+            game_pos.map(|p|   ("game",   p)),
+            bplist_pos.map(|p| ("bplist", p)),
+            xml_pos.map(|p|    ("xml",    p)),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|&(_, p)| p);
+
+        match first {
+            Some(("xml", xml_rel)) => {
+                let xml_start = ucua_pos + xml_rel;
+                let Some(end_rel) = find_subsequence(&data[xml_start..], b"</plist>") else {
+                    search_from = ucua_pos + 4;
+                    continue;
+                };
+                let plist_end = xml_start + end_rel + 8;
+                let plist_bytes = &data[xml_start..plist_end];
+                let pre_xml = &data[ucua_pos..xml_start];
+                if let Some(device) = parse_aupreset_plist(plist_bytes, pre_xml) {
+                    entries.push(UcuaEntry { pos: ucua_pos, kind: UcuaKind::ThirdParty(device) });
+                }
+                search_from = plist_end;
+            }
+            Some(("game", game_rel)) => {
+                let between_end = (ucua_pos + game_rel).min(data.len());
+                let between = &data[ucua_pos + 4..between_end];
+                let name = extract_plugin_name(between)
+                    .unwrap_or_else(|| "Logic built-in".to_string());
+                entries.push(UcuaEntry { pos: ucua_pos, kind: UcuaKind::BuiltIn(name) });
+                search_from = ucua_pos + 4;
+            }
+            // bplist00 (Smart Controls) or no signal — not a plugin slot.
+            _ => {
+                search_from = ucua_pos + 4;
+            }
+        }
+    }
+
+    entries
+}
+
+/// Associate each `UCuA` entry with its nearest preceding `karT` entry by file
+/// position, then return only tracks that have at least one plugin.
+///
+/// Plugins that appear before the first TRAK (rare) are returned separately as
+/// the fallback `all_devices` list used by the legacy "Plugin Chain" display.
+fn associate_plugins_to_tracks(
+    mut traks: Vec<TrakEntry>,
+    ucuas: Vec<UcuaEntry>,
+) -> (Vec<LogicTrack>, Vec<LogicDevice>) {
+    traks.sort_unstable_by_key(|t| t.pos);
+
+    let mut track_devices: Vec<Vec<LogicDevice>> = vec![vec![]; traks.len()];
+    let mut unassociated: Vec<LogicDevice> = Vec::new();
+
+    for ucua in ucuas {
+        let device = match ucua.kind {
+            UcuaKind::ThirdParty(d) => d,
+            UcuaKind::BuiltIn(name) => LogicDevice {
+                name,
+                manufacturer: "Logic".to_string(),
+                component_type: String::new(),
+                component_subtype: String::new(),
+                bypassed: false,
+                state: vec![],
+            },
+        };
+        // partition_point gives the first index where trak.pos >= ucua.pos,
+        // so idx-1 is the last TRAK that starts before this UCuA.
+        let idx = traks.partition_point(|t| t.pos < ucua.pos);
+        if idx == 0 {
+            unassociated.push(device);
+        } else {
+            track_devices[idx - 1].push(device);
+        }
+    }
+
+    let tracks = traks
+        .into_iter()
+        .zip(track_devices)
+        .filter(|(_, devices)| !devices.is_empty())
+        .map(|(trak, devices)| LogicTrack {
+            name: trak.name,
+            kind: TrackKind::Unknown,
+            devices,
+        })
+        .collect();
+
+    (tracks, unassociated)
 }
 
 /// Extract the track name from a `qeSM` chunk.
@@ -299,60 +415,6 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|w| w == needle)
-}
-
-// ─── Third-party AU plugin extractor (UCuA → .aupreset) ──────────────────────
-
-/// Scan the raw `ProjectData` bytes for `UCuA` blocks that contain an embedded
-/// `.aupreset`-format XML plist, extract each one as a `LogicDevice`.
-///
-/// Built-in Logic effects (followed by `GAME`) and Smart Controls NSKeyedArchiver
-/// blobs (followed by `bplist00`) are silently skipped.
-fn scan_ucua_devices(data: &[u8]) -> Vec<LogicDevice> {
-    let mut devices = Vec::new();
-    let mut search_from = 0;
-
-    loop {
-        let Some(ucua_rel) = find_subsequence(&data[search_from..], b"UCuA") else {
-            break;
-        };
-        let ucua_pos = search_from + ucua_rel;
-
-        // Look for an XML plist start within 50 KB of this UCuA.
-        let window_end = (ucua_pos + 51_200).min(data.len());
-        let Some(xml_rel) = find_subsequence(&data[ucua_pos..window_end], b"<?xml") else {
-            search_from = ucua_pos + 4;
-            continue;
-        };
-        let xml_start = ucua_pos + xml_rel;
-
-        // If GAME or bplist00 appears between UCuA and the XML, this slot is a
-        // built-in Logic effect or Smart Controls blob — skip it.
-        let inter = &data[ucua_pos..xml_start];
-        if find_subsequence(inter, b"GAME").is_some()
-            || find_subsequence(inter, b"bplist00").is_some()
-        {
-            search_from = ucua_pos + 4;
-            continue;
-        }
-
-        // Find the closing plist tag.
-        let Some(end_rel) = find_subsequence(&data[xml_start..], b"</plist>") else {
-            search_from = ucua_pos + 4;
-            continue;
-        };
-        let plist_end = xml_start + end_rel + 8;
-        let plist_bytes = &data[xml_start..plist_end];
-        let pre_xml = &data[ucua_pos..xml_start];
-
-        if let Some(device) = parse_aupreset_plist(plist_bytes, pre_xml) {
-            devices.push(device);
-        }
-
-        search_from = plist_end;
-    }
-
-    devices
 }
 
 /// Parse an embedded `.aupreset` XML plist and return a `LogicDevice`.
@@ -674,29 +736,36 @@ mod tests {
         }
 
         let project = read_logicx(path).expect("must not error on real session");
-        eprintln!("take me away — version: {}, tracks: {}, devices: {}",
+        let all_track_devices: Vec<&LogicDevice> = project.tracks.iter()
+            .flat_map(|t| t.devices.iter())
+            .collect();
+        let all_devices_any: Vec<&LogicDevice> = all_track_devices.iter()
+            .copied()
+            .chain(project.all_devices.iter())
+            .collect();
+
+        eprintln!("take me away — version: {}, tracks (with plugins): {}, unassociated: {}",
             project.logic_version, project.tracks.len(), project.all_devices.len());
+        for t in &project.tracks {
+            eprintln!("  track {:?}: {} plugin(s)", t.name, t.devices.len());
+            for d in &t.devices {
+                eprintln!("    device: {:?} type={} sub={} mfr={}", d.name, d.component_type, d.component_subtype, d.manufacturer);
+            }
+        }
 
         assert!(
-            !project.all_devices.is_empty(),
+            !all_devices_any.is_empty(),
             "real session should have third-party AU devices"
         );
 
-        for d in &project.all_devices {
-            eprintln!(
-                "  device: {:?} type={} sub={} mfr={} state={}B",
-                d.name, d.component_type, d.component_subtype, d.manufacturer, d.state.len()
-            );
+        for d in all_track_devices.iter().filter(|d| !d.state.is_empty()) {
             assert!(!d.component_type.is_empty());
             assert!(!d.component_subtype.is_empty());
-            assert!(!d.state.is_empty(), "device {:?} has empty state", d.name);
         }
 
-        // Expect at least Soundtoys Little Plate and Omnisphere
-        let has_soundtoys = project.all_devices.iter()
-            .any(|d| d.manufacturer == "SToy");
-        let has_omnisphere = project.all_devices.iter()
-            .any(|d| d.component_subtype == "Ambr");
+        // Expect at least Soundtoys Little Plate and Omnisphere (in tracks or fallback)
+        let has_soundtoys = all_devices_any.iter().any(|d| d.manufacturer == "SToy");
+        let has_omnisphere = all_devices_any.iter().any(|d| d.component_subtype == "Ambr");
         assert!(has_soundtoys, "expected Soundtoys device");
         assert!(has_omnisphere, "expected Omnisphere device");
     }
