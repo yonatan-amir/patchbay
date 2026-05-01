@@ -85,6 +85,25 @@ const LOGIC_MAGIC: &[u8] = &[0x23, 0x47, 0xc0, 0xab];
 /// channel strips the gap is typically 500 KB+ (an AU state blob in between).
 const TRACK_GAP_THRESHOLD: usize = 100_000;
 
+/// Reversed-byte-order 4CC for track chunk headers.
+const KART: &[u8] = b"karT";
+
+/// Reversed-byte-order 4CC for MIDI sequence sub-chunks (holds track name).
+const QESM: &[u8] = b"qeSM";
+
+/// Name patterns that identify template / system tracks in Logic Pro.
+/// Real user-created tracks appear AFTER the last track whose name matches one
+/// of these patterns.
+const TEMPLATE_PATTERNS: &[&str] = &[
+    "*",
+    "Default Clip",
+    "Global Harmonies",
+    "Automation",
+    "automation",
+    "Empty Project",
+    "Drummer",
+];
+
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
@@ -167,7 +186,12 @@ pub fn read_logicx(path: &Path) -> Result<LogicProject, LogicError> {
 
     let (tracks, all_devices) = if data.starts_with(LOGIC_MAGIC) {
         let ucuas = collect_ucua_entries(&data);
-        (cluster_ucuas_into_tracks(ucuas), vec![])
+        let mut tracks = cluster_ucuas_into_tracks(ucuas);
+        let names = scan_track_names(&data);
+        for (track, name) in tracks.iter_mut().zip(names.iter()) {
+            track.name = name.clone();
+        }
+        (tracks, vec![])
     } else {
         let root = plist::Value::from_reader(std::io::Cursor::new(&data))?;
         (extract_tracks_plist(root.as_dictionary()), vec![])
@@ -368,7 +392,6 @@ fn derive_cluster_name(devices: &[LogicDevice], fallback_idx: usize) -> String {
 ///
 /// This triplet appears at a variable offset (~48–72 bytes) within the chunk.
 /// We scan forward from offset 48, testing each position for a valid triplet.
-#[cfg(test)]
 fn extract_name_from_qesm(data: &[u8], qesm_start: usize) -> Option<String> {
     let lo = qesm_start + 48;
     let hi = (qesm_start + 128).min(data.len().saturating_sub(3));
@@ -395,6 +418,57 @@ fn extract_name_from_qesm(data: &[u8], qesm_start: usize) -> Option<String> {
     }
 
     None
+}
+
+fn is_template_track(name: &str) -> bool {
+    TEMPLATE_PATTERNS.iter().any(|pat| name.contains(pat))
+}
+
+/// Scan for real user-visible track names in a Logic Pro binary `ProjectData`.
+///
+/// Logic Pro stores both template/system `karT` entries and real user track
+/// entries. The real user tracks always appear AFTER the last template track in
+/// the file. We find that anchor position and return only the names that follow.
+fn scan_track_names(data: &[u8]) -> Vec<String> {
+    struct TrakEntry {
+        pos: usize,
+        name: Option<String>,
+    }
+
+    let mut entries: Vec<TrakEntry> = Vec::new();
+    let mut search_from = 0;
+
+    loop {
+        let Some(rel) = find_subsequence(&data[search_from..], KART) else { break };
+        let kart_pos = search_from + rel;
+
+        // Look for a qeSM sub-chunk within the next 4 KB after the karT tag.
+        let window_end = (kart_pos + 4096).min(data.len());
+        let window = &data[kart_pos..window_end];
+        let name = find_subsequence(window, QESM)
+            .and_then(|qesm_rel| extract_name_from_qesm(data, kart_pos + qesm_rel));
+
+        entries.push(TrakEntry { pos: kart_pos, name });
+        search_from = kart_pos + 4;
+    }
+
+    // Find the last template/system track position to use as an anchor.
+    let last_template_pos = entries
+        .iter()
+        .filter(|e| e.name.as_deref().map(is_template_track).unwrap_or(false))
+        .map(|e| e.pos)
+        .last();
+
+    match last_template_pos {
+        Some(anchor) => entries
+            .iter()
+            .filter(|e| e.pos > anchor)
+            .filter_map(|e| e.name.clone())
+            .filter(|n| !is_template_track(n))
+            .collect(),
+        // No template anchor — return all named TRAKs (e.g. older project formats).
+        None => entries.iter().filter_map(|e| e.name.clone()).collect(),
+    }
 }
 
 /// Return the byte offset of `needle` within `haystack`, or `None`.
