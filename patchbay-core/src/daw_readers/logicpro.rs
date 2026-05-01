@@ -837,6 +837,27 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
+    fn integration_v00_project() {
+        let path = std::path::Path::new(
+            "/Users/jonathanamir/projects/take me away/take me away V0 Project/take me away v0.0.logicx",
+        );
+        if !path.exists() {
+            eprintln!("integration test skipped: v0.0 project not found");
+            return;
+        }
+        let project = read_logicx(path).expect("must not error on v0.0 project");
+        eprintln!("v0.0 — version: {}, tracks: {}", project.logic_version, project.tracks.len());
+        for t in &project.tracks {
+            eprintln!("  track {:?}: {} plugin(s)", t.name, t.devices.len());
+            for d in &t.devices {
+                eprintln!("    {:?} type={} sub={} mfr={}", d.name, d.component_type, d.component_subtype, d.manufacturer);
+            }
+        }
+        assert!(!project.tracks.is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn integration_library_project() {
         let path = std::path::Path::new(
             "/Users/jonathanamir/Music/Logic Pro Library.bundle/Projects/Live Loop Grids/Skyline Masher.logicx",
