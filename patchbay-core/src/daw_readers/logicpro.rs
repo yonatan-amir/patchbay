@@ -189,7 +189,11 @@ pub fn read_logicx(path: &Path) -> Result<LogicProject, LogicError> {
         let mut tracks = cluster_ucuas_into_tracks(ucuas);
         let names = scan_track_names(&data);
         for (track, name) in tracks.iter_mut().zip(names.iter()) {
-            track.name = name.clone();
+            // Only override the derived name when the Logic name is user-assigned
+            // (not the default "Untitled").
+            if name != "Untitled" && !name.is_empty() {
+                track.name = name.clone();
+            }
         }
         (tracks, vec![])
     } else {
