@@ -65,6 +65,7 @@ export default function Chains({ onBack }: ChainsProps) {
   const [liveProject, setLiveProject] = useState<LiveProject | null>(null);
   const [chains, setChains] = useState<ChainRow[]>([]);
   const [pendingTrack, setPendingTrack] = useState<LiveTrack | null>(null);
+  const [watcherError, setWatcherError] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<ChainRow[]>("list_chains").then(setChains).catch(() => {});
@@ -76,15 +77,24 @@ export default function Chains({ onBack }: ChainsProps) {
   useEffect(() => {
     let offChanged: (() => void) | undefined;
     let offClosed: (() => void) | undefined;
+    let offError: (() => void) | undefined;
 
-    listen<LiveProject>("project-changed", e => setLiveProject(e.payload))
-      .then(fn => { offChanged = fn; });
+    listen<LiveProject>("project-changed", e => {
+      setLiveProject(e.payload);
+      setWatcherError(null);
+    }).then(fn => { offChanged = fn; });
+
     listen<unknown>("project-closed", () => setLiveProject(null))
       .then(fn => { offClosed = fn; });
+
+    listen<{ path: string; error: string }>("project-error", e => {
+      setWatcherError(e.payload.error);
+    }).then(fn => { offError = fn; });
 
     return () => {
       offChanged?.();
       offClosed?.();
+      offError?.();
     };
   }, []);
 
@@ -122,6 +132,11 @@ export default function Chains({ onBack }: ChainsProps) {
               <span className="ml-2 text-xs text-zinc-600 font-medium">{liveProject.daw}</span>
             )}
           </div>
+          {watcherError && (
+            <div className="px-4 py-2 text-xs text-red-400 border-b border-zinc-900 font-mono leading-snug">
+              {watcherError}
+            </div>
+          )}
           {!liveProject ? (
             <div className="flex items-center justify-center flex-1 text-zinc-600 text-xs p-8 text-center leading-relaxed">
               Open a project in your DAW — tracks will appear here automatically

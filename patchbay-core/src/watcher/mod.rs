@@ -149,13 +149,25 @@ fn hash_file(path: &Path) -> Option<[u8; 32]> {
 }
 
 fn hash_logic_package(dir: &Path) -> Option<[u8; 32]> {
-    // Hash only the main binary — avoids false triggers from Finder metadata.
-    let data_path = dir.join("ProjectData");
-    if data_path.exists() {
-        return hash_file(&data_path);
+    // Use file mtime rather than content SHA-256 — ProjectData can be
+    // 50–200 MB; hashing content on every notify event (Finder writes,
+    // autosave bookkeeping, etc.) causes continuous high CPU usage.
+    // Mtime changes precisely when Logic Pro saves the project, which is
+    // the only moment we care about re-parsing.
+    //
+    // Logic 10.1+: ProjectData lives in Alternatives/000/.
+    let modern = dir.join("Alternatives").join("000").join("ProjectData");
+    if let Some(h) = mtime_hash(&modern) {
+        return Some(h);
     }
-    // Fallback: hash all file modification times in the package.
-    let mut h = Sha256::new();
+    // Pre-10.1: ProjectData at the package root.
+    for name in &["ProjectData", "projectData"] {
+        if let Some(h) = mtime_hash(&dir.join(name)) {
+            return Some(h);
+        }
+    }
+    // Last resort: hash all file modification times in the package root.
+    let mut hasher = Sha256::new();
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .ok()?
         .filter_map(|e| e.ok())
@@ -165,12 +177,25 @@ fn hash_logic_package(dir: &Path) -> Option<[u8; 32]> {
         if let Ok(meta) = e.metadata() {
             if let Ok(t) = meta.modified() {
                 if let Ok(d) = t.duration_since(std::time::UNIX_EPOCH) {
-                    h.update(d.as_nanos().to_le_bytes());
+                    hasher.update(d.as_nanos().to_le_bytes());
                 }
             }
         }
-        h.update(e.file_name().as_encoded_bytes());
+        hasher.update(e.file_name().as_encoded_bytes());
     }
+    Some(hasher.finalize().into())
+}
+
+fn mtime_hash(path: &Path) -> Option<[u8; 32]> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let nanos = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let mut h = Sha256::new();
+    h.update(nanos.to_le_bytes());
+    h.update(path.as_os_str().as_encoded_bytes());
     Some(h.finalize().into())
 }
 
@@ -301,8 +326,9 @@ fn find_via_cmdline(pid: u32, extensions: &[&str]) -> Option<PathBuf> {
 #[cfg(target_os = "windows")]
 fn find_via_recent_dirs(entry: &DawEntry) -> Option<PathBuf> {
     // Scan standard project directories for the most recently modified file
-    // whose extension matches and whose mtime is within 90 s (i.e. the
-    // session has been open recently).
+    // whose extension matches and whose mtime is within 8 hours (i.e. opened
+    // in the current working session). 90 s was too tight — Ableton doesn't
+    // always write the project file within 90 s of launch.
     //
     // This is a heuristic fallback. A full implementation would enumerate
     // kernel file handles via NtQuerySystemInformation / NtQueryObject.
@@ -310,15 +336,22 @@ fn find_via_recent_dirs(entry: &DawEntry) -> Option<PathBuf> {
     let docs = home.join("Documents");
 
     let search_dirs: &[PathBuf] = &match entry.kind {
-        DawKind::Ableton => vec![docs.join("Ableton").join("Projects"), docs.join("Ableton")],
+        DawKind::Ableton => vec![
+            docs.join("Ableton").join("Projects"),
+            docs.join("Ableton"),
+            // Users frequently store projects outside Documents
+            PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default())
+                .join("Music").join("Ableton"),
+        ],
         DawKind::Reaper => vec![docs.clone()],
         DawKind::Bitwig => vec![docs.join("Bitwig Studio").join("Projects")],
         DawKind::StudioOne => vec![docs.join("Studio One").join("Songs")],
         DawKind::Logic => vec![], // Logic does not run on Windows
     };
 
+    // 8 hours: covers a full working session without stale file risk.
     let cutoff = std::time::SystemTime::now()
-        .checked_sub(Duration::from_secs(90))
+        .checked_sub(Duration::from_secs(8 * 3600))
         .unwrap_or(std::time::UNIX_EPOCH);
 
     for dir in search_dirs {
@@ -453,8 +486,14 @@ fn register_project(
     } else {
         RecursiveMode::NonRecursive
     };
-    if watcher.watch(&path, mode).is_err() {
-        return;
+    // Watch failure is non-fatal: we still do the initial parse so the
+    // frontend sees the current state. Future file-change events just won't
+    // arrive — the 60 s catch-all timer will re-hash periodically instead.
+    if let Err(e) = watcher.watch(&path, mode) {
+        let _ = events_tx.send(WatchEvent::ParseError {
+            path: path.clone(),
+            error: format!("notify watch failed (continuing without live updates): {e}"),
+        });
     }
     let hash = hash_project(&path, is_directory);
     let _ = events_tx.send(WatchEvent::ProjectOpened {
@@ -463,8 +502,16 @@ fn register_project(
     });
     // Parse immediately so the frontend sees the current state without waiting
     // for a file-change event (which never fires if nothing changes after launch).
-    if let Ok(parsed) = parse_project(&path, entry.kind) {
-        let _ = events_tx.send(WatchEvent::ProjectChanged { parsed });
+    match parse_project(&path, entry.kind) {
+        Ok(parsed) => {
+            let _ = events_tx.send(WatchEvent::ProjectChanged { parsed });
+        }
+        Err(e) => {
+            let _ = events_tx.send(WatchEvent::ParseError {
+                path: path.clone(),
+                error: format!("initial parse failed: {e}"),
+            });
+        }
     }
     active.insert(
         pid,
@@ -512,7 +559,11 @@ fn worker(events_tx: Sender<WatchEvent>, stop_rx: Receiver<()>) {
         }
 
         // ── Refresh process list ──────────────────────────────────────────────
-        sys.refresh_processes_specifics(ProcessRefreshKind::new());
+        // Refresh exe once (immutable after launch) so match_daw can check
+        // both the process name and exe path. We don't need cpu/memory/environ.
+        sys.refresh_processes_specifics(
+            ProcessRefreshKind::new().with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
+        );
         let check_existing = last_recheck.elapsed() >= RECHECK_INTERVAL;
         if check_existing {
             last_recheck = Instant::now();
@@ -532,9 +583,12 @@ fn worker(events_tx: Sender<WatchEvent>, stop_rx: Receiver<()>) {
             match notify_rx.recv_timeout(timeout) {
                 Ok(Ok(event)) => {
                     // Only care about data-modifying events.
+                    // macOS FSEvents backend emits ModifyKind::Any for most
+                    // writes, so accept that alongside the more specific variant.
                     let is_write = matches!(
                         event.kind,
                         notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
+                            | notify::EventKind::Modify(notify::event::ModifyKind::Any)
                             | notify::EventKind::Create(_)
                     );
                     if !is_write {
