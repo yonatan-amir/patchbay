@@ -51,13 +51,17 @@
 //! | Omnisphere 3    | `aumu` | `Ambr`  | `GOSW` |
 //!
 //! ## Track → plugin association
-//! `karT`/`qeSM` chunks give track names; `UCuA` chunks give plugin slots.
-//! The reader correlates them by file position: each `UCuA` is assigned to
-//! the nearest preceding `karT`. Tracks with no plugins are discarded before
-//! returning. This is a positional heuristic — not a spec-level guarantee —
-//! but it produces the correct result for standard sequential project layouts.
-//! Plugins that appear before the first `karT` (rare) fall back to
-//! `LogicProject::all_devices`.
+//! Logic Pro does NOT interleave `karT` track headers with their `UCuA` plugin
+//! slots. In a typical project all `karT` headers appear near one end of the
+//! file and all channel-strip data (UCuA blocks) in the middle, making
+//! positional TRAK-based association impossible.
+//!
+//! The reader instead clusters `UCuA` entries by file-position gap: when two
+//! consecutive UCuA tags are more than `TRACK_GAP_THRESHOLD` bytes apart, a
+//! new track is started. Within a single channel strip UCuA blocks are at most
+//! ~9 KB apart; between channel strips the gap is typically 500 KB+ (the large
+//! AU state blob of the preceding instrument). Each cluster becomes one
+//! `LogicTrack`. Tracks with no plugins are never emitted.
 //!
 //! # Fallback
 //! Older Logic 9 projects used a plain plist dictionary. The reader detects
@@ -76,11 +80,14 @@ use thiserror::Error;
 /// so only the stable prefix is checked.
 const LOGIC_MAGIC: &[u8] = &[0x23, 0x47, 0xc0, 0xab];
 
-/// 4-byte reversed tag for a Track chunk (`Trak` LE).
-const TRAK: &[u8] = b"karT";
-
 /// 4-byte reversed tag for the MIDI/Audio Sequence sub-chunk (`MSeq` LE).
+#[cfg(test)]
 const QESM: &[u8] = b"qeSM";
+
+/// Gap between consecutive `UCuA` byte offsets that indicates a track boundary.
+/// Within a single channel strip UCuA blocks are ≤ ~9 KB apart; between
+/// channel strips the gap is typically 500 KB+ (an AU state blob in between).
+const TRACK_GAP_THRESHOLD: usize = 100_000;
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 
@@ -163,9 +170,8 @@ pub fn read_logicx(path: &Path) -> Result<LogicProject, LogicError> {
     let data = std::fs::read(&data_path)?;
 
     let (tracks, all_devices) = if data.starts_with(LOGIC_MAGIC) {
-        let traks = collect_trak_entries(&data);
         let ucuas = collect_ucua_entries(&data);
-        associate_plugins_to_tracks(traks, ucuas)
+        (cluster_ucuas_into_tracks(ucuas), vec![])
     } else {
         let root = plist::Value::from_reader(std::io::Cursor::new(&data))?;
         (extract_tracks_plist(root.as_dictionary()), vec![])
@@ -227,11 +233,6 @@ fn parse_project_info(plist_path: &Path) -> (Option<String>, String) {
 
 // ─── Proprietary binary format parser ────────────────────────────────────────
 
-struct TrakEntry {
-    pos: usize,
-    name: String,
-}
-
 enum UcuaKind {
     ThirdParty(LogicDevice),
     BuiltIn(String),
@@ -240,29 +241,6 @@ enum UcuaKind {
 struct UcuaEntry {
     pos: usize,
     kind: UcuaKind,
-}
-
-/// Collect all `karT` chunk positions and their track names from `qeSM` sub-chunks.
-fn collect_trak_entries(data: &[u8]) -> Vec<TrakEntry> {
-    let mut entries = Vec::new();
-    let mut pos = 0;
-
-    while pos + 4 <= data.len() {
-        if data[pos..].starts_with(TRAK) {
-            let window_end = (pos + 512).min(data.len());
-            if let Some(qesm_rel) = find_subsequence(&data[pos..window_end], QESM) {
-                let qesm_abs = pos + qesm_rel;
-                if let Some(name) = extract_name_from_qesm(data, qesm_abs) {
-                    entries.push(TrakEntry { pos, name });
-                }
-            }
-            pos += 50;
-        } else {
-            pos += 1;
-        }
-    }
-
-    entries
 }
 
 /// Collect all `UCuA` plugin slot positions, capturing both built-in Logic
@@ -325,21 +303,28 @@ fn collect_ucua_entries(data: &[u8]) -> Vec<UcuaEntry> {
     entries
 }
 
-/// Associate each `UCuA` entry with its nearest preceding `karT` entry by file
-/// position, then return only tracks that have at least one plugin.
+/// Group `UCuA` entries into per-track clusters using file-position gaps.
 ///
-/// Plugins that appear before the first TRAK (rare) are returned separately as
-/// the fallback `all_devices` list used by the legacy "Plugin Chain" display.
-fn associate_plugins_to_tracks(
-    mut traks: Vec<TrakEntry>,
-    ucuas: Vec<UcuaEntry>,
-) -> (Vec<LogicTrack>, Vec<LogicDevice>) {
-    traks.sort_unstable_by_key(|t| t.pos);
+/// Logic Pro serializes each channel strip's plugin slots contiguously in the
+/// file, then places the next channel strip after the state blobs for the first
+/// (which can be 500 KB+ for large instruments like Omnisphere). A gap above
+/// `TRACK_GAP_THRESHOLD` between consecutive UCuA offsets signals a new track.
+fn cluster_ucuas_into_tracks(ucuas: Vec<UcuaEntry>) -> Vec<LogicTrack> {
+    if ucuas.is_empty() {
+        return vec![];
+    }
 
-    let mut track_devices: Vec<Vec<LogicDevice>> = vec![vec![]; traks.len()];
-    let mut unassociated: Vec<LogicDevice> = Vec::new();
+    let mut clusters: Vec<Vec<LogicDevice>> = Vec::new();
+    let mut current: Vec<LogicDevice> = Vec::new();
+    let mut last_pos: usize = 0;
 
     for ucua in ucuas {
+        if !current.is_empty() && ucua.pos.saturating_sub(last_pos) > TRACK_GAP_THRESHOLD {
+            clusters.push(current);
+            current = Vec::new();
+        }
+        last_pos = ucua.pos;
+
         let device = match ucua.kind {
             UcuaKind::ThirdParty(d) => d,
             UcuaKind::BuiltIn(name) => LogicDevice {
@@ -351,28 +336,33 @@ fn associate_plugins_to_tracks(
                 state: vec![],
             },
         };
-        // partition_point gives the first index where trak.pos >= ucua.pos,
-        // so idx-1 is the last TRAK that starts before this UCuA.
-        let idx = traks.partition_point(|t| t.pos < ucua.pos);
-        if idx == 0 {
-            unassociated.push(device);
-        } else {
-            track_devices[idx - 1].push(device);
-        }
+        current.push(device);
+    }
+    if !current.is_empty() {
+        clusters.push(current);
     }
 
-    let tracks = traks
+    clusters
         .into_iter()
-        .zip(track_devices)
-        .filter(|(_, devices)| !devices.is_empty())
-        .map(|(trak, devices)| LogicTrack {
-            name: trak.name,
+        .enumerate()
+        .map(|(idx, devices)| LogicTrack {
+            name: derive_cluster_name(&devices, idx + 1),
             kind: TrackKind::Unknown,
             devices,
         })
-        .collect();
+        .collect()
+}
 
-    (tracks, unassociated)
+/// Derive a display name for a plugin cluster.
+/// Uses the first instrument AU (aumu) name, then any other third-party plugin
+/// name, then falls back to "Track N".
+fn derive_cluster_name(devices: &[LogicDevice], fallback_idx: usize) -> String {
+    devices
+        .iter()
+        .find(|d| d.component_type == "aumu")
+        .or_else(|| devices.iter().find(|d| !d.component_subtype.is_empty()))
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| format!("Track {}", fallback_idx))
 }
 
 /// Extract the track name from a `qeSM` chunk.
@@ -382,6 +372,7 @@ fn associate_plugins_to_tracks(
 ///
 /// This triplet appears at a variable offset (~48–72 bytes) within the chunk.
 /// We scan forward from offset 48, testing each position for a valid triplet.
+#[cfg(test)]
 fn extract_name_from_qesm(data: &[u8], qesm_start: usize) -> Option<String> {
     let lo = qesm_start + 48;
     let hi = (qesm_start + 128).min(data.len().saturating_sub(3));
