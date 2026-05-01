@@ -80,10 +80,6 @@ use thiserror::Error;
 /// so only the stable prefix is checked.
 const LOGIC_MAGIC: &[u8] = &[0x23, 0x47, 0xc0, 0xab];
 
-/// 4-byte reversed tag for the MIDI/Audio Sequence sub-chunk (`MSeq` LE).
-#[cfg(test)]
-const QESM: &[u8] = b"qeSM";
-
 /// Gap between consecutive `UCuA` byte offsets that indicates a track boundary.
 /// Within a single channel strip UCuA blocks are ≤ ~9 KB apart; between
 /// channel strips the gap is typically 500 KB+ (an AU state blob in between).
