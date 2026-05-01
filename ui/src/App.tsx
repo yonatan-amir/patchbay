@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react"
 import { invoke } from "@tauri-apps/api/core"
 import Chains from "./views/Chains"
+import { Dashboard } from "./views/Dashboard"
 import { PluginFilters, type Filters, type Plugin } from "./components/PluginFilters"
 import { PluginList } from "./components/PluginList"
 import { CenterPanel } from "./components/CenterPanel"
@@ -26,7 +27,7 @@ const FORMAT_COLORS: Record<string, string> = {
   CLAP: "text-purple-400",
 }
 
-type Mode = "browser" | "live"
+type Mode = "browser" | "dashboard" | "live"
 
 export default function App() {
   const [mode, setMode] = useState<Mode>("browser")
@@ -159,12 +160,21 @@ export default function App() {
         <span className="font-bold tracking-tight text-sm">Patchbay</span>
 
         <div className="flex text-xs border border-zinc-700 rounded overflow-hidden">
-          <button className="px-3 py-1 bg-zinc-700 text-white cursor-default">
+          <button
+            onClick={() => setMode("browser")}
+            className={`px-3 py-1 transition-colors ${mode === "browser" ? "bg-zinc-700 text-white" : "text-zinc-500 hover:text-zinc-300"}`}
+          >
             Browser
           </button>
           <button
+            onClick={() => setMode("dashboard")}
+            className={`px-3 py-1 transition-colors border-l border-zinc-700 ${mode === "dashboard" ? "bg-zinc-700 text-white" : "text-zinc-500 hover:text-zinc-300"}`}
+          >
+            Dashboard
+          </button>
+          <button
             onClick={() => setMode("live")}
-            className="px-3 py-1 text-zinc-500 hover:text-zinc-300 transition-colors"
+            className="px-3 py-1 transition-colors border-l border-zinc-700 text-zinc-500 hover:text-zinc-300"
           >
             Live
           </button>
@@ -212,14 +222,6 @@ export default function App() {
         )}
 
         <button
-          onClick={exportDossier}
-          disabled={exporting || plugins.length === 0}
-          className="bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 border border-zinc-700 rounded px-3 py-1 text-xs transition-colors"
-        >
-          {exporting ? "Exporting…" : "Export"}
-        </button>
-
-        <button
           onClick={scan}
           disabled={scanning}
           className="bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 border border-zinc-700 rounded px-3 py-1 text-xs transition-colors"
@@ -235,13 +237,13 @@ export default function App() {
           <button onClick={() => setScanError(null)} className="text-zinc-600 hover:text-zinc-400 ml-auto">✕</button>
         </div>
       )}
-      {exportError && (
+      {exportError && mode !== "dashboard" && (
         <div className="flex items-center gap-3 px-4 py-2 text-red-400 text-xs border-b border-zinc-800 shrink-0">
           <span>Export failed: {exportError}</span>
           <button onClick={() => setExportError(null)} className="text-zinc-600 hover:text-zinc-400 ml-auto">✕</button>
         </div>
       )}
-      {exportResult && (
+      {exportResult && mode !== "dashboard" && (
         <div className="flex items-center gap-3 px-4 py-2 text-xs border-b border-zinc-800 bg-zinc-900/60 shrink-0">
           <span className="text-green-400">✓</span>
           <span className="text-zinc-400">Exported {exportResult.plugin_count} plugins</span>
@@ -261,8 +263,25 @@ export default function App() {
         </div>
       )}
 
+      {/* Dashboard body */}
+      {mode === "dashboard" && (
+        <div className="flex flex-1 overflow-hidden">
+          <Dashboard
+            plugins={plugins}
+            scanning={scanning}
+            exporting={exporting}
+            exportResult={exportResult}
+            exportError={exportError}
+            onScan={scan}
+            onExport={exportDossier}
+            onOpenPath={openPath}
+            onDismissExport={() => setExportResult(null)}
+          />
+        </div>
+      )}
+
       {/* 3-panel body */}
-      <div className="flex flex-1 overflow-hidden">
+      {mode === "browser" && <div className="flex flex-1 overflow-hidden">
         {/* Left: Plugin list */}
         <div className="w-72 min-w-[200px] border-r border-zinc-800 flex flex-col overflow-hidden">
           <PluginFilters plugins={plugins} filters={filters} onChange={patchFilters} />
@@ -293,7 +312,7 @@ export default function App() {
         <div className="w-80 min-w-[240px] flex flex-col overflow-hidden border-l border-zinc-800">
           <RightPanel chainId={selectedChainId} onDeleteChain={handleDeleteChain} />
         </div>
-      </div>
+      </div>}
     </div>
   )
 }
